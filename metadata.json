@@ -1,0 +1,6 @@
+{
+  "name": "NetScope",
+  "description": "Autonomous Android network traffic monitor, local VPN/MITM inspector, and built-in API client.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

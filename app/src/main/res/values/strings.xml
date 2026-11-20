@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">NetScope</string>
+    <string name="vpn_notification_channel_name">Перехват NetScope</string>
+    <string name="vpn_notification_channel_desc">Постоянное уведомление при работе локального VPN-мониторинга</string>
+    <string name="vpn_notification_title">Монитор трафика NetScope активен</string>
+    <string name="vpn_notification_body">Анализ локального трафика через MITM-прокси 127.0.0.1</string>
+    <string name="overlay_notification_title">Плавающий монитор NetScope</string>
+    <string name="action_stop_capture">Остановить</string>
+    <string name="nav_dashboard">Главная</string>
+    <string name="nav_traffic">Трафик</string>
+    <string name="nav_api_client">API-клиент</string>
+    <string name="nav_history">История</string>
+    <string name="nav_settings">Настройки</string>
+</resources>

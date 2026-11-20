@@ -45,6 +45,9 @@ object ProxyIpcBridge {
   private val _capturedTransactions = MutableSharedFlow<CapturedTransaction>(extraBufferCapacity = 256)
   val capturedTransactions: SharedFlow<CapturedTransaction> = _capturedTransactions.asSharedFlow()
 
+  private val _recentTransactions = MutableStateFlow<List<CapturedTransaction>>(emptyList())
+  val recentTransactions: StateFlow<List<CapturedTransaction>> = _recentTransactions.asStateFlow()
+
   private val _vpnStatus = MutableStateFlow(VpnRuntimeStatus())
   val vpnStatus: StateFlow<VpnRuntimeStatus> = _vpnStatus.asStateFlow()
 
@@ -74,7 +77,18 @@ object ProxyIpcBridge {
   }
 
   fun emitDirectTransaction(tx: CapturedTransaction) {
+    recordRecent(tx)
     _capturedTransactions.tryEmit(tx)
+  }
+
+  fun clearRecentTransactions() {
+    _recentTransactions.value = emptyList()
+  }
+
+  private fun recordRecent(tx: CapturedTransaction) {
+    val current = _recentTransactions.value
+    if (current.firstOrNull()?.id == tx.id) return
+    _recentTransactions.value = (listOf(tx) + current.filterNot { it.id == tx.id }).take(150)
   }
 
   fun registerAppProcessReceiver(context: Context): BroadcastReceiver {
@@ -85,7 +99,10 @@ object ProxyIpcBridge {
             ACTION_TRANSACTION_CAPTURED -> {
               val raw = intent.getStringExtra(EXTRA_TX_JSON) ?: return
               runCatching { json.decodeFromString(CapturedTransaction.serializer(), raw) }
-                .onSuccess { _capturedTransactions.tryEmit(it) }
+                .onSuccess {
+                  recordRecent(it)
+                  _capturedTransactions.tryEmit(it)
+                }
             }
             ACTION_VPN_STATUS -> {
               _vpnStatus.value =

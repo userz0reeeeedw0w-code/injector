@@ -9,8 +9,6 @@ import android.app.PendingIntent
 import android.app.Service
 import android.app.usage.UsageEvents
 import android.app.usage.UsageStatsManager
-import android.content.ClipData
-import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
@@ -20,12 +18,15 @@ import android.graphics.PixelFormat
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.net.Uri
+import android.net.VpnService
 import android.os.Build
 import android.os.IBinder
 import android.os.Process
 import android.provider.Settings
+import android.text.Editable
 import android.text.InputType
 import android.text.TextUtils
+import android.text.TextWatcher
 import android.view.ContextThemeWrapper
 import android.view.Gravity
 import android.view.MotionEvent
@@ -43,15 +44,22 @@ import android.widget.Button
 import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.FrameLayout
+import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.ScrollView
-import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
 import androidx.core.app.NotificationCompat
+import com.netscope.core.network.ipc.ProxyIpcBridge
+import com.netscope.core.network.vpn.NetScopeVpnService
+import com.netscope.core.proxy.ca.CaCertificateManager
 import com.netscope.feature.injector.data.InjectorScripts
 import com.netscope.feature.injector.data.InjectorStore
 import com.netscope.feature.injector.data.JsSourceItem
+import com.netscope.feature.injector.data.OverlayDataExtractor
+import com.netscope.feature.injector.data.WebViewNetworkBridge
+import com.netscope.shared.model.CapturedTransaction
+import java.util.UUID
 import kotlin.math.abs
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -62,15 +70,20 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import org.json.JSONArray
+import org.json.JSONObject
 import org.json.JSONTokener
 
 /**
- * Foreground-сервис с использованием WindowManager:
- * 1) Отображает постоянную перетаскиваемую иконку (пузырь `</>`) поверх других приложений.
- * 2) При нажатии на иконку открывает оверлей настроек Инжектора (тумблеры, источники JS, фильтр ВК)
- *    и лениво инициализируемую песочницу WebView с DevTools (Eruda / vConsole / офлайн-консоль).
+ * Foreground-сервис (WindowManager):
+ * 1) Показывает перетаскиваемую кнопку `</>` поверх других приложений (вкл. ВК).
+ * 2) По нажатию открывает пристыкованную снизу консоль DevTools в стиле Eruda:
+ *    «Сеть» (таблица Имя/Метод/Статус/Тип/Размер/Время + копирование JSON/cURL),
+ *    «Консоль» (выполнение JS), «Данные» (авто-извлечение токенов/кук/initData),
+ *    «WebView» (песочница с Eruda и перехватом fetch/XHR), «Настройки».
  */
 class InjectorOverlayService : Service() {
   companion object {
@@ -79,7 +92,6 @@ class InjectorOverlayService : Service() {
     const val EXTRA_TARGET_PACKAGES = "extra_target_packages"
     const val EXTRA_ONLY_IN_TARGETS = "extra_only_in_targets"
     const val EXTRA_INITIAL_URL = "extra_initial_url"
-
     const val DEFAULT_VK_PACKAGES = "com.vkontakte.android,com.vk.im,com.vk.vkvideo"
 
     private const val CHANNEL_ID = "netscope_injector_overlay_channel"
@@ -105,17 +117,9 @@ class InjectorOverlayService : Service() {
       val appOps = context.getSystemService(Context.APP_OPS_SERVICE) as? AppOpsManager ?: return false
       val mode =
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-          appOps.unsafeCheckOpNoThrow(
-            AppOpsManager.OPSTR_GET_USAGE_STATS,
-            Process.myUid(),
-            context.packageName,
-          )
+          appOps.unsafeCheckOpNoThrow(AppOpsManager.OPSTR_GET_USAGE_STATS, Process.myUid(), context.packageName)
         } else {
-          appOps.checkOpNoThrow(
-            AppOpsManager.OPSTR_GET_USAGE_STATS,
-            Process.myUid(),
-            context.packageName,
-          )
+          appOps.checkOpNoThrow(AppOpsManager.OPSTR_GET_USAGE_STATS, Process.myUid(), context.packageName)
         }
       return mode == AppOpsManager.MODE_ALLOWED
     }
@@ -137,37 +141,67 @@ class InjectorOverlayService : Service() {
     }
 
     fun stop(context: Context) {
-      val intent = Intent(context, InjectorOverlayService::class.java).apply { action = ACTION_STOP }
-      context.startService(intent)
+      context.startService(Intent(context, InjectorOverlayService::class.java).apply { action = ACTION_STOP })
     }
   }
 
   private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
   private lateinit var store: InjectorStore
   private var windowManager: WindowManager? = null
+  private var layoutParams: WindowManager.LayoutParams? = null
   private var containerView: FrameLayout? = null
   private var bubbleView: TextView? = null
   private var panelView: LinearLayout? = null
 
-  private var tabSettingsBtn: Button? = null
-  private var tabSandboxBtn: Button? = null
-  private var settingsScroll: ScrollView? = null
-  private var sandboxColumn: LinearLayout? = null
-  private var sourcesContainer: LinearLayout? = null
-  private var webViewContainer: FrameLayout? = null
+  private var bubbleX = 0
+  private var bubbleY = 0
+  private var isExpanded = false
+  private var isTallMode = false
+  private var activeTab = 0 // 0=Сеть, 1=Консоль, 2=Данные, 3=WebView, 4=Настройки
 
+  private val tabButtons = mutableListOf<Button>()
+  private val tabPanels = mutableListOf<View>()
+
+  // Состояние вкладки «Сеть»
+  private var vpnStatusBadge: TextView? = null
+  private var vpnHintBanner: LinearLayout? = null
+  private var networkRecBtn: Button? = null
+  private var networkFilterModeBtn: Button? = null
+  private var networkSearchInput: EditText? = null
+  private var networkTableHeader: LinearLayout? = null
+  private var networkListScroll: ScrollView? = null
+  private var networkListContainer: LinearLayout? = null
+  private var networkDetailBox: LinearLayout? = null
+  private var networkDetailText: TextView? = null
+  private var selectedTx: CapturedTransaction? = null
+  private var isNetworkPaused = false
+  private var vkFilterEnabled = false
+  private var networkSearchQuery = ""
+  private var latestTransactions: List<CapturedTransaction> = emptyList()
+
+  // Состояние вкладки «Консоль»
+  private var consoleInput: EditText? = null
+  private var consoleLogsText: TextView? = null
+  private val consoleHistory = ArrayList<String>()
+
+  // Состояние вкладки «Данные»
+  private var dataCategoryFilter: String? = null
+  private var dataListContainer: LinearLayout? = null
+
+  // Состояние вкладки «WebView» и «Настройки»
   private var urlEditText: EditText? = null
+  private var webViewContainer: FrameLayout? = null
   private var webView: WebView? = null
   private var inspectorBox: ScrollView? = null
   private var inspectorText: TextView? = null
-  private var layoutParams: WindowManager.LayoutParams? = null
+  private var sourcesContainer: LinearLayout? = null
 
-  private var isExpanded = false
-  private var activeOverlayTab = 0 // 0 = Настройки Инжектора, 1 = Песочница WebView
   private var currentUrl = "https://m.vk.com"
   private var onlyInTargets = false
   private var targetPackages: Set<String> = emptySet()
   private var watcherJob: Job? = null
+  private var ipcJob: Job? = null
+  private var vpnJob: Job? = null
   private var lastProbeMs = 0L
   private var lastForegroundPkg = ""
 
@@ -176,6 +210,8 @@ class InjectorOverlayService : Service() {
   override fun onCreate() {
     super.onCreate()
     store = InjectorStore(this)
+    bubbleX = dp(16)
+    bubbleY = dp(180)
   }
 
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -200,9 +236,11 @@ class InjectorOverlayService : Service() {
 
     if (containerView == null) {
       attachOverlay()
+      observeLiveTrafficAndVpn()
     } else {
       urlEditText?.setText(currentUrl)
       renderSourcesList()
+      renderNetworkTable()
     }
 
     startForegroundWatcher()
@@ -213,11 +251,7 @@ class InjectorOverlayService : Service() {
     val nm = getSystemService(NotificationManager::class.java)
     if (nm.getNotificationChannel(CHANNEL_ID) == null) {
       nm.createNotificationChannel(
-        NotificationChannel(
-          CHANNEL_ID,
-          "Плавающая иконка Инжектора",
-          NotificationManager.IMPORTANCE_LOW,
-        )
+        NotificationChannel(CHANNEL_ID, "Консоль Инжектора NetScope", NotificationManager.IMPORTANCE_LOW)
       )
     }
     val stopPi =
@@ -229,25 +263,17 @@ class InjectorOverlayService : Service() {
       )
     val openAppPi =
       packageManager.getLaunchIntentForPackage(packageName)?.let {
-        PendingIntent.getActivity(
-          this,
-          4,
-          it,
-          PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-        )
+        PendingIntent.getActivity(this, 4, it, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
       }
 
-    val statusDesc =
-      if (onlyInTargets && hasUsageAccess(this)) {
-        "Авто-показ в выбранных приложениях (ВК и др.)"
-      } else {
-        "Иконка </> активна поверх приложений — нажмите для настроек"
-      }
+    val desc =
+      if (onlyInTargets && hasUsageAccess(this)) "Авто-показ в ВК — нажмите </> для консоли"
+      else "Иконка </> активна — нажмите для открытия DevTools"
 
     val notification: Notification =
       NotificationCompat.Builder(this, CHANNEL_ID)
-        .setContentTitle("NetScope: Инжектор поверх окон")
-        .setContentText(statusDesc)
+        .setContentTitle("NetScope DevTools поверх приложений")
+        .setContentText(desc)
         .setSmallIcon(android.R.drawable.ic_menu_edit)
         .setOngoing(true)
         .setContentIntent(openAppPi)
@@ -267,11 +293,8 @@ class InjectorOverlayService : Service() {
     windowManager = wm
 
     val layoutType =
-      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-        WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-      } else {
-        @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE
-      }
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+      else @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE
 
     val params =
       WindowManager.LayoutParams(
@@ -282,30 +305,30 @@ class InjectorOverlayService : Service() {
         PixelFormat.TRANSLUCENT,
       ).apply {
         gravity = Gravity.TOP or Gravity.START
-        x = dp(18)
-        y = dp(180)
+        x = bubbleX
+        y = bubbleY
         softInputMode = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_PAN
       }
     layoutParams = params
 
     val root = FrameLayout(this)
 
-    // 1. Постоянная плавающая иконка (Bubble)
+    // 1. Плавающая иконка </>
     val bubble =
       TextView(this).apply {
         text = "</>"
-        contentDescription = "Открыть настройки инжектора"
-        setTextColor(Color.rgb(0, 229, 255))
-        textSize = 16f
+        contentDescription = "Открыть консоль DevTools"
+        setTextColor(OverlayPalette.accentCyan)
+        textSize = 15.5f
         setTypeface(Typeface.MONOSPACE, Typeface.BOLD)
         gravity = Gravity.CENTER
         background =
           GradientDrawable().apply {
             shape = GradientDrawable.OVAL
-            setColor(Color.argb(245, 11, 18, 32))
-            setStroke(dp(2), Color.rgb(0, 229, 255))
+            setColor(Color.argb(245, 24, 26, 31))
+            setStroke(dp(2), OverlayPalette.accentCyan)
           }
-        layoutParams = FrameLayout.LayoutParams(dp(56), dp(56))
+        layoutParams = FrameLayout.LayoutParams(dp(54), dp(54))
         elevation = dp(8).toFloat()
       }
 
@@ -331,15 +354,17 @@ class InjectorOverlayService : Service() {
           val dy = event.rawY - downRawY
           if (abs(dx) > touchSlop || abs(dy) > touchSlop) {
             moved = true
-            params.x = startX + dx.toInt()
-            params.y = startY + dy.toInt()
+            bubbleX = startX + dx.toInt()
+            bubbleY = startY + dy.toInt()
+            params.x = bubbleX
+            params.y = bubbleY
             runCatching { wm.updateViewLayout(root, params) }
           }
           true
         }
         MotionEvent.ACTION_UP -> {
           if (!moved) {
-            selectOverlayTab(0)
+            selectOverlayTab(0) // Открываем сразу вкладку «Сеть» как в Eruda
             setExpanded(true)
           }
           true
@@ -348,123 +373,125 @@ class InjectorOverlayService : Service() {
       }
     }
 
-    // 2. Раскрываемый оверлей настроек Инжектора и ленивой песочницы
+    // 2. Нижняя пристыкованная консоль в стиле Eruda
     val themedCtx = ContextThemeWrapper(this, android.R.style.Theme_DeviceDefault_NoActionBar)
     val panel =
       LinearLayout(themedCtx).apply {
         orientation = LinearLayout.VERTICAL
         visibility = View.GONE
-        background =
-          GradientDrawable().apply {
-            setColor(Color.argb(248, 12, 19, 32))
-            cornerRadius = dp(16).toFloat()
-            setStroke(dp(1), Color.rgb(0, 229, 255))
-          }
-        setPadding(dp(12), dp(10), dp(12), dp(12))
-        layoutParams = FrameLayout.LayoutParams(dp(344), dp(500))
+        setBackgroundColor(OverlayPalette.bgPanel)
+        layoutParams = FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, computePanelHeight())
       }
 
-    val header =
+    // Верхняя тонкая граница + шапка управления
+    panel.addView(
+      View(themedCtx).apply {
+        setBackgroundColor(OverlayPalette.border)
+        layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(1).coerceAtLeast(1))
+      }
+    )
+
+    val topStrip =
       LinearLayout(themedCtx).apply {
         orientation = LinearLayout.HORIZONTAL
         gravity = Gravity.CENTER_VERTICAL
+        setBackgroundColor(OverlayPalette.bgHeader)
+        setPadding(dp(10), dp(2), dp(6), dp(2))
       }
-    val title =
+    topStrip.addView(
       TextView(themedCtx).apply {
-        text = "Настройки Инжектора"
-        setTextColor(Color.rgb(0, 229, 255))
-        textSize = 14f
+        text = "</> DevTools"
+        setTextColor(OverlayPalette.accentCyan)
+        textSize = 12.5f
         setTypeface(Typeface.MONOSPACE, Typeface.BOLD)
         layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
       }
-    val minBtn =
-      Button(themedCtx).apply {
-        text = "—"
-        setTextColor(Color.WHITE)
-        setBackgroundColor(Color.TRANSPARENT)
-        minimumWidth = dp(38)
-        minimumHeight = dp(38)
-        setPadding(dp(4), 0, dp(4), 0)
-        setOnClickListener { setExpanded(false) }
+    )
+    val badge =
+      TextView(themedCtx).apply {
+        text = "○ Вкл. VPN"
+        textSize = 10.5f
+        setTextColor(OverlayPalette.amberWarn)
+        setPadding(dp(8), dp(3), dp(8), dp(3))
+        background =
+          GradientDrawable().apply {
+            setColor(OverlayPalette.bgButton)
+            cornerRadius = dp(10).toFloat()
+          }
+        setOnClickListener { startOrOpenVpn() }
       }
-    val closeBtn =
-      Button(themedCtx).apply {
-        text = "×"
-        setTextColor(Color.rgb(244, 63, 94))
-        textSize = 16f
-        setBackgroundColor(Color.TRANSPARENT)
-        minimumWidth = dp(38)
-        minimumHeight = dp(38)
-        setPadding(dp(4), 0, dp(4), 0)
-        setOnClickListener { cleanupAndStop() }
-      }
-    header.addView(title)
-    header.addView(minBtn)
-    header.addView(closeBtn)
+    vpnStatusBadge = badge
+    topStrip.addView(badge)
 
-    header.setOnTouchListener { _, event ->
-      when (event.action) {
-        MotionEvent.ACTION_DOWN -> {
-          startX = params.x
-          startY = params.y
-          downRawX = event.rawX
-          downRawY = event.rawY
-          true
-        }
-        MotionEvent.ACTION_MOVE -> {
-          params.x = startX + (event.rawX - downRawX).toInt()
-          params.y = startY + (event.rawY - downRawY).toInt()
-          runCatching { wm.updateViewLayout(root, params) }
-          true
-        }
-        else -> false
+    topStrip.addView(
+      OverlayUi.iconBarButton(themedCtx, "↕", OverlayPalette.textPrimary, "Изменить высоту") {
+        isTallMode = !isTallMode
+        updateExpandedLayout()
       }
+    )
+    topStrip.addView(
+      OverlayUi.iconBarButton(themedCtx, "—", OverlayPalette.textPrimary, "Свернуть в иконку") {
+        setExpanded(false)
+      }
+    )
+    topStrip.addView(
+      OverlayUi.iconBarButton(themedCtx, "×", OverlayPalette.redErr, "Закрыть сервис") {
+        cleanupAndStop()
+      }
+    )
+    panel.addView(topStrip)
+
+    // Горизонтальная панель вкладок в стиле Eruda
+    val tabLabels = listOf("Сеть", "Консоль", "Данные", "WebView", "Настройки")
+    val tabsScroll =
+      HorizontalScrollView(themedCtx).apply {
+        isHorizontalScrollBarEnabled = false
+        setBackgroundColor(OverlayPalette.bgTabBar)
+      }
+    val tabsRow = LinearLayout(themedCtx).apply { orientation = LinearLayout.HORIZONTAL }
+    tabButtons.clear()
+    tabLabels.forEachIndexed { idx, label ->
+      val tb =
+        Button(themedCtx).apply {
+          text = label
+          textSize = 12f
+          setAllCaps(false)
+          setPadding(dp(12), dp(4), dp(12), dp(4))
+          minimumHeight = dp(36)
+          minHeight = dp(36)
+          minimumWidth = dp(66)
+          setOnClickListener { selectOverlayTab(idx) }
+        }
+      tabButtons.add(tb)
+      tabsRow.addView(tb)
+    }
+    tabsScroll.addView(tabsRow)
+    panel.addView(OverlayUi.wrapWithBottomBorder(themedCtx, LinearLayout(themedCtx).apply {
+      orientation = LinearLayout.VERTICAL
+      addView(tabsScroll)
+    }, OverlayPalette.border))
+
+    val contentFrame =
+      FrameLayout(themedCtx).apply {
+        layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f)
+      }
+
+    val p0 = buildNetworkTab(themedCtx)
+    val p1 = buildConsoleTab(themedCtx)
+    val p2 = buildDataTab(themedCtx)
+    val p3 = buildWebViewTab(themedCtx)
+    val p4 = buildSettingsTab(themedCtx)
+    tabPanels.clear()
+    tabPanels.addAll(listOf(p0, p1, p2, p3, p4))
+    tabPanels.forEach {
+      it.visibility = View.GONE
+      contentFrame.addView(
+        it,
+        FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT),
+      )
     }
 
-    val tabsRow =
-      LinearLayout(themedCtx).apply {
-        orientation = LinearLayout.HORIZONTAL
-        setPadding(0, dp(6), 0, dp(8))
-      }
-    val settingsTab =
-      Button(themedCtx).apply {
-        text = "Настройки и JS"
-        textSize = 11.5f
-        setAllCaps(false)
-        layoutParams =
-          LinearLayout.LayoutParams(0, dp(36), 1f).apply { marginEnd = dp(4) }
-        setOnClickListener { selectOverlayTab(0) }
-      }
-    val sandboxTab =
-      Button(themedCtx).apply {
-        text = "Песочница WebView"
-        textSize = 11.5f
-        setAllCaps(false)
-        layoutParams =
-          LinearLayout.LayoutParams(0, dp(36), 1f).apply { marginStart = dp(4) }
-        setOnClickListener { selectOverlayTab(1) }
-      }
-    tabSettingsBtn = settingsTab
-    tabSandboxBtn = sandboxTab
-    tabsRow.addView(settingsTab)
-    tabsRow.addView(sandboxTab)
-
-    val settingsContent = buildSettingsOverlayContent(themedCtx)
-    val settingsScrollView =
-      ScrollView(themedCtx).apply {
-        layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f)
-        addView(settingsContent)
-      }
-    settingsScroll = settingsScrollView
-
-    val sandboxLayout = buildSandboxOverlayShell(themedCtx)
-    sandboxLayout.visibility = View.GONE
-    sandboxColumn = sandboxLayout
-
-    panel.addView(header)
-    panel.addView(tabsRow)
-    panel.addView(settingsScrollView)
-    panel.addView(sandboxLayout)
+    panel.addView(contentFrame)
 
     bubbleView = bubble
     panelView = panel
@@ -483,270 +510,384 @@ class InjectorOverlayService : Service() {
     }
   }
 
-  @SuppressLint("UseSwitchCompatOrMaterialCode")
-  private fun buildSettingsOverlayContent(ctx: Context): LinearLayout {
-    val col = LinearLayout(ctx).apply { orientation = LinearLayout.VERTICAL }
-    val cfg = store.config.value
+  private fun buildNetworkTab(ctx: Context): LinearLayout {
+    val root = LinearLayout(ctx).apply { orientation = LinearLayout.VERTICAL }
 
-    col.addView(sectionHeader(ctx, "Параметры инъекции (обход CSP)"))
-
-    col.addView(
-      switchRow(ctx, "Авто-инжект JS при загрузке", cfg.masterEnabled) { checked ->
-        store.updateConfig { it.copy(masterEnabled = checked) }
-      }
-    )
-    col.addView(
-      switchRow(ctx, "Разблокировать выделение текста", cfg.unlockSelection) { checked ->
-        store.updateConfig { it.copy(unlockSelection = checked) }
-      }
-    )
-    col.addView(
-      switchRow(ctx, "Разрешить пинч-зум (до 6x)", cfg.forceZoom) { checked ->
-        store.updateConfig { it.copy(forceZoom = checked) }
-      }
-    )
-    col.addView(
-      switchRow(ctx, "Удалённая отладка (chrome://inspect)", cfg.remoteDebug) { checked ->
-        store.updateConfig { it.copy(remoteDebug = checked) }
-        runCatching { WebView.setWebContentsDebuggingEnabled(checked) }
-      }
-    )
-    col.addView(
-      switchRow(ctx, "Логировать URL и initData", cfg.logVisits) { checked ->
-        store.updateConfig { it.copy(logVisits = checked) }
-      }
-    )
-
-    col.addView(sectionHeader(ctx, "Показ поверх ВК и приложений"))
-
-    col.addView(
-      switchRow(ctx, "Показывать только в списке ниже", cfg.overlayOnlyInTargets) { checked ->
-        onlyInTargets = checked
-        store.updateConfig { it.copy(overlayOnlyInTargets = checked) }
-        startAsForeground()
-        startForegroundWatcher()
-      }
-    )
-
-    val pkgInput =
-      EditText(ctx).apply {
-        setText(cfg.overlayTargetPackages.ifBlank { DEFAULT_VK_PACKAGES })
-        hint = "com.vkontakte.android,com.vk.im"
-        setTextColor(Color.WHITE)
-        setHintTextColor(Color.GRAY)
-        textSize = 11.5f
-        setSingleLine(true)
-        setPadding(dp(8), dp(6), dp(8), dp(6))
-        background =
-          GradientDrawable().apply {
-            setColor(Color.rgb(23, 33, 52))
-            cornerRadius = dp(8).toFloat()
-          }
-      }
-    col.addView(pkgInput)
-
-    val pkgBtnRow =
+    // Тулбар как в Eruda Network (●, ⊘, фильтр ВК/Все, поиск, копировать всё)
+    val toolbar =
       LinearLayout(ctx).apply {
         orientation = LinearLayout.HORIZONTAL
-        setPadding(0, dp(4), 0, dp(4))
+        gravity = Gravity.CENTER_VERTICAL
+        setBackgroundColor(Color.rgb(32, 34, 37))
+        setPadding(dp(8), dp(2), dp(8), dp(2))
       }
-    pkgBtnRow.addView(
-      smallActionBtn(ctx, "Сохранить пакеты") {
-        val raw = pkgInput.text.toString().trim().ifBlank { DEFAULT_VK_PACKAGES }
-        store.updateConfig { it.copy(overlayTargetPackages = raw) }
-        targetPackages = raw.split(',', ';', ' ').map { it.trim().lowercase() }.filter { it.isNotBlank() }.toSet()
-        Toast.makeText(this, "Список пакетов сохранён", Toast.LENGTH_SHORT).show()
-        startForegroundWatcher()
+    val recBtn =
+      OverlayUi.iconBarButton(ctx, "●", OverlayPalette.redErr, "Пауза / запись") {
+        isNetworkPaused = !isNetworkPaused
+        networkRecBtn?.setTextColor(if (isNetworkPaused) OverlayPalette.textMuted else OverlayPalette.redErr)
+        Toast.makeText(this, if (isNetworkPaused) "Обновление таблицы на паузе" else "Запись активна", Toast.LENGTH_SHORT).show()
+      }
+    networkRecBtn = recBtn
+    toolbar.addView(recBtn)
+
+    toolbar.addView(
+      OverlayUi.iconBarButton(ctx, "⊘", OverlayPalette.textMuted, "Очистить список") {
+        ProxyIpcBridge.clearRecentTransactions()
+        selectedTx = null
+        renderNetworkTable()
       }
     )
-    pkgBtnRow.addView(
-      smallActionBtn(
-        ctx,
-        if (hasUsageAccess(this)) "Статистика: ОК" else "Доступ к статистике",
-      ) {
-        runCatching {
-          startActivity(
-            Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+
+    val spacer = View(ctx).apply { layoutParams = LinearLayout.LayoutParams(0, 1, 1f) }
+    toolbar.addView(spacer)
+
+    val filterBtn =
+      OverlayUi.chipButton(ctx, "Все") {
+        vkFilterEnabled = !vkFilterEnabled
+        networkFilterModeBtn?.text = if (vkFilterEnabled) "Только ВК" else "Все"
+        renderNetworkTable()
+      }
+    networkFilterModeBtn = filterBtn
+    toolbar.addView(filterBtn)
+
+    toolbar.addView(
+      OverlayUi.iconBarButton(ctx, "🔍", OverlayPalette.textMuted, "Поиск по URL/телу") {
+        val inp = networkSearchInput ?: return@iconBarButton
+        inp.visibility = if (inp.visibility == View.VISIBLE) View.GONE else View.VISIBLE
+      }
+    )
+
+    toolbar.addView(
+      OverlayUi.iconBarButton(ctx, "❐", OverlayPalette.textPrimary, "Копировать все запросы") {
+        val visible = filteredTransactions()
+        if (visible.isEmpty()) {
+          Toast.makeText(this, "Нет запросов для копирования", Toast.LENGTH_SHORT).show()
+        } else {
+          OverlayUi.copyToClipboard(
+            this,
+            "NetScope Network",
+            OverlayDataExtractor.buildSummaryTableText(visible),
+            "Скопировано запросов: ${visible.size}",
           )
         }
-        setExpanded(false)
       }
     )
-    col.addView(pkgBtnRow)
+    root.addView(OverlayUi.wrapWithBottomBorder(ctx, toolbar, OverlayPalette.divider))
 
-    col.addView(sectionHeader(ctx, "Источники JS (Eruda / vConsole / Офлайн)"))
-    val srcListLayout = LinearLayout(ctx).apply { orientation = LinearLayout.VERTICAL }
-    sourcesContainer = srcListLayout
-    col.addView(srcListLayout)
-    renderSourcesList()
+    val searchEdit =
+      OverlayUi.darkInput(ctx, "Фильтр по имени, URL, телу...").apply {
+        visibility = View.GONE
+        addTextChangedListener(
+          object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) = Unit
+            override fun afterTextChanged(s: Editable?) {
+              networkSearchQuery = s?.toString().orEmpty()
+              renderNetworkTable()
+            }
+          }
+        )
+      }
+    networkSearchInput = searchEdit
+    root.addView(searchEdit)
 
-    val addUrlEdit =
-      EditText(ctx).apply {
-        hint = "Своя JS-ссылка: https://cdn.../script.js"
-        setTextColor(Color.WHITE)
-        setHintTextColor(Color.GRAY)
-        textSize = 11.5f
-        inputType = InputType.TYPE_TEXT_VARIATION_URI
-        setSingleLine(true)
-        setPadding(dp(8), dp(6), dp(8), dp(6))
-        background =
-          GradientDrawable().apply {
-            setColor(Color.rgb(23, 33, 52))
-            cornerRadius = dp(8).toFloat()
-          }
+    // Подсказка про VPN, если перехват ещё не включён
+    val banner =
+      LinearLayout(ctx).apply {
+        orientation = LinearLayout.HORIZONTAL
+        gravity = Gravity.CENTER_VERTICAL
+        setBackgroundColor(Color.rgb(42, 34, 20))
+        setPadding(dp(8), dp(5), dp(8), dp(5))
       }
-    val initEdit =
-      EditText(ctx).apply {
-        hint = "Код запуска (необяз., напр. eruda.init();)"
-        setTextColor(Color.WHITE)
-        setHintTextColor(Color.GRAY)
-        textSize = 11.5f
-        setSingleLine(true)
-        setPadding(dp(8), dp(6), dp(8), dp(6))
-        background =
-          GradientDrawable().apply {
-            setColor(Color.rgb(23, 33, 52))
-            cornerRadius = dp(8).toFloat()
-          }
-        layoutParams =
-          LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT,
-            LinearLayout.LayoutParams.WRAP_CONTENT,
-          ).apply { topMargin = dp(4) }
+    banner.addView(
+      TextView(ctx).apply {
+        text = "VPN выкл — для трафика из ВК включите VPN (или используйте WebView)"
+        setTextColor(OverlayPalette.amberWarn)
+        textSize = 10.5f
+        layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
       }
-    val trustCheck =
-      CheckBox(ctx).apply {
-        text = "Подтверждаю: доверяю добавляемому JS-скрипту"
-        setTextColor(Color.rgb(203, 213, 225))
+    )
+    banner.addView(
+      OverlayUi.chipButton(ctx, "Вкл. VPN", accent = true) { startOrOpenVpn() }
+    )
+    vpnHintBanner = banner
+    root.addView(banner)
+
+    val hdr = OverlayUi.buildNetworkTableHeader(ctx)
+    networkTableHeader = hdr
+    root.addView(hdr)
+
+    val listCol = LinearLayout(ctx).apply { orientation = LinearLayout.VERTICAL }
+    networkListContainer = listCol
+    val listScroll =
+      ScrollView(ctx).apply {
+        layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f)
+        addView(listCol)
+      }
+    networkListScroll = listScroll
+    root.addView(listScroll)
+
+    // Детальный просмотр выбранного запроса + быстрые кнопки копирования
+    val detailBox =
+      LinearLayout(ctx).apply {
+        orientation = LinearLayout.VERTICAL
+        visibility = View.GONE
+        setBackgroundColor(OverlayPalette.bgHeader)
+        layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f)
+      }
+    val detailBar =
+      HorizontalScrollView(ctx).apply {
+        isHorizontalScrollBarEnabled = false
+        setBackgroundColor(OverlayPalette.bgTabBar)
+      }
+    val detailBtns =
+      LinearLayout(ctx).apply {
+        orientation = LinearLayout.HORIZONTAL
+        setPadding(dp(6), dp(4), dp(6), dp(4))
+      }
+    detailBtns.addView(
+      OverlayUi.chipButton(ctx, "← Назад") {
+        selectedTx = null
+        renderNetworkTable()
+      }
+    )
+    detailBtns.addView(
+      OverlayUi.chipButton(ctx, "Ответ JSON", accent = true) {
+        selectedTx?.let { tx ->
+          val body = OverlayDataExtractor.prettyFormatBody(tx.responseBody)
+          OverlayUi.copyToClipboard(this, "Response", body, "Ответ скопирован")
+        }
+      }
+    )
+    detailBtns.addView(
+      OverlayUi.chipButton(ctx, "URL") {
+        selectedTx?.let { OverlayUi.copyToClipboard(this, "URL", it.fullUrl, "URL скопирован") }
+      }
+    )
+    detailBtns.addView(
+      OverlayUi.chipButton(ctx, "Заголовки") {
+        selectedTx?.let { tx ->
+          val headers = tx.requestHeaders.joinToString("\n") { "${it.name}: ${it.value}" }
+          OverlayUi.copyToClipboard(this, "Headers", headers.ifBlank { "(пусто)" }, "Заголовки скопированы")
+        }
+      }
+    )
+    detailBtns.addView(
+      OverlayUi.chipButton(ctx, "cURL") {
+        selectedTx?.let { tx ->
+          OverlayUi.copyToClipboard(this, "cURL", OverlayDataExtractor.buildCurlCommand(tx), "cURL скопирован")
+        }
+      }
+    )
+    detailBtns.addView(
+      OverlayUi.chipButton(ctx, "Всё") {
+        selectedTx?.let { tx ->
+          OverlayUi.copyToClipboard(this, "Request Dump", OverlayDataExtractor.buildTransactionDump(tx), "Всё скопировано")
+        }
+      }
+    )
+    detailBar.addView(detailBtns)
+    detailBox.addView(detailBar)
+
+    val detailTv =
+      TextView(ctx).apply {
+        setTextColor(OverlayPalette.textPrimary)
         textSize = 11f
-        isChecked = store.config.value.disclaimerAccepted
+        typeface = Typeface.MONOSPACE
+        setTextIsSelectable(true)
+        setPadding(dp(10), dp(8), dp(10), dp(10))
+      }
+    networkDetailText = detailTv
+    detailBox.addView(
+      ScrollView(ctx).apply {
+        layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f)
+        addView(detailTv)
+      }
+    )
+    networkDetailBox = detailBox
+    root.addView(detailBox)
+
+    return root
+  }
+
+  private fun buildConsoleTab(ctx: Context): LinearLayout {
+    val root =
+      LinearLayout(ctx).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(dp(8), dp(6), dp(8), dp(6))
       }
 
-    col.addView(addUrlEdit)
-    col.addView(initEdit)
-    col.addView(trustCheck)
+    val inputRow =
+      LinearLayout(ctx).apply {
+        orientation = LinearLayout.HORIZONTAL
+        gravity = Gravity.CENTER_VERTICAL
+      }
+    val jsIn = OverlayUi.darkInput(ctx, "JS код (напр. document.cookie)", "document.title").apply {
+      layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply { marginEnd = dp(6) }
+    }
+    consoleInput = jsIn
+    inputRow.addView(jsIn)
+    inputRow.addView(
+      OverlayUi.chipButton(ctx, "Run", accent = true) {
+        val code = jsIn.text.toString().trim()
+        if (code.isBlank()) return@chipButton
+        runConsoleCode(ctx, code)
+      }
+    )
+    root.addView(inputRow)
 
-    val addSourceBtn =
-      Button(ctx).apply {
-        text = "Добавить и скачать JS"
-        textSize = 12f
-        setAllCaps(false)
-        setTextColor(Color.rgb(6, 12, 22))
-        background =
-          GradientDrawable().apply {
-            setColor(Color.rgb(0, 229, 255))
-            cornerRadius = dp(8).toFloat()
-          }
-        setOnClickListener {
-          val url = addUrlEdit.text.toString().trim()
-          if (!url.startsWith("http://") && !url.startsWith("https://")) {
-            Toast.makeText(this@InjectorOverlayService, "Введите корректный http(s) URL", Toast.LENGTH_SHORT).show()
-            return@setOnClickListener
-          }
-          if (!trustCheck.isChecked) {
-            Toast.makeText(this@InjectorOverlayService, "Отметьте подтверждение доверия скрипту", Toast.LENGTH_SHORT).show()
-            return@setOnClickListener
-          }
-          store.updateConfig { it.copy(disclaimerAccepted = true) }
-          val added = store.addCustomSource(url, initEdit.text.toString())
-          addUrlEdit.setText("")
-          initEdit.setText("")
-          renderSourcesList()
-          scope.launch {
-            store.fetchAndCacheSource(added).onSuccess { bytes ->
-              Toast.makeText(
-                this@InjectorOverlayService,
-                "Загружено ${added.name} (${bytes / 1024} КБ)",
-                Toast.LENGTH_SHORT,
-              ).show()
-              renderSourcesList()
-            }.onFailure { err ->
-              Toast.makeText(
-                this@InjectorOverlayService,
-                "Ошибка загрузки: ${err.message}",
-                Toast.LENGTH_LONG,
-              ).show()
+    val presetsRow =
+      HorizontalScrollView(ctx).apply {
+        isHorizontalScrollBarEnabled = false
+        setPadding(0, dp(6), 0, dp(6))
+      }
+    val presets = LinearLayout(ctx).apply { orientation = LinearLayout.HORIZONTAL }
+    listOf(
+      "Cookie" to "document.cookie",
+      "LocalStorage" to "JSON.stringify(localStorage)",
+      "URL" to "location.href",
+      "TG WebApp" to "window.Telegram&&Telegram.WebApp?Telegram.WebApp.initData:'none'",
+      "Копировать лог" to "__COPY__",
+      "Очистить" to "__CLR__",
+    ).forEach { (label, expr) ->
+      presets.addView(
+        OverlayUi.chipButton(ctx, label) {
+          when (expr) {
+            "__COPY__" ->
+              OverlayUi.copyToClipboard(this, "Console", consoleHistory.joinToString("\n"), "Лог скопирован")
+            "__CLR__" -> {
+              consoleHistory.clear()
+              consoleLogsText?.text = "Консоль очищена."
+            }
+            else -> {
+              jsIn.setText(expr)
+              runConsoleCode(ctx, expr)
             }
           }
         }
-      }
-    col.addView(addSourceBtn)
+      )
+    }
+    presetsRow.addView(presets)
+    root.addView(presetsRow)
 
-    col.addView(sectionHeader(ctx, "Быстрые действия"))
-    val bottomRow =
-      LinearLayout(ctx).apply {
-        orientation = LinearLayout.HORIZONTAL
-        setPadding(0, dp(2), 0, dp(8))
+    val outTv =
+      TextView(ctx).apply {
+        text = "Введите JS для выполнения в открытой WebView-вкладке или нажмите «WebView» чтобы загрузить мини-аппку."
+        setTextColor(OverlayPalette.greenOk)
+        textSize = 11f
+        typeface = Typeface.MONOSPACE
+        setTextIsSelectable(true)
+        setPadding(dp(8), dp(6), dp(8), dp(6))
       }
-    bottomRow.addView(
-      smallActionBtn(ctx, "Песочница здесь") {
-        selectOverlayTab(1)
+    consoleLogsText = outTv
+    root.addView(
+      ScrollView(ctx).apply {
+        setBackgroundColor(OverlayPalette.bgInput)
+        layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f)
+        addView(outTv)
       }
     )
-    bottomRow.addView(
-      smallActionBtn(ctx, "Очистить WebView") {
-        runCatching {
-          CookieManager.getInstance().removeAllCookies(null)
-          CookieManager.getInstance().flush()
-          WebStorage.getInstance().deleteAllData()
-          webView?.clearCache(true)
-          Toast.makeText(this, "Cookies и кэш очищены", Toast.LENGTH_SHORT).show()
+    return root
+  }
+
+  private fun runConsoleCode(ctx: Context, code: String) {
+    val wv = webView
+    if (wv == null) {
+      appendConsoleLog("WARN: WebView не открыт. Переключаю на вкладку WebView...")
+      selectOverlayTab(3)
+      ensureOverlayWebView(ctx)
+      return
+    }
+    wv.evaluateJavascript(code) { res ->
+      val decoded = decodeJsString(res ?: "null")
+      appendConsoleLog("> $code\n< $decoded")
+    }
+  }
+
+  private fun appendConsoleLog(entry: String) {
+    consoleHistory.add(0, entry)
+    if (consoleHistory.size > 60) consoleHistory.removeAt(consoleHistory.lastIndex)
+    consoleLogsText?.text = consoleHistory.joinToString("\n\n")
+  }
+
+  private fun buildDataTab(ctx: Context): LinearLayout {
+    val root =
+      LinearLayout(ctx).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(dp(8), dp(6), dp(8), dp(6))
+      }
+
+    val barScroll = HorizontalScrollView(ctx).apply { isHorizontalScrollBarEnabled = false }
+    val bar = LinearLayout(ctx).apply { orientation = LinearLayout.HORIZONTAL }
+    listOf(
+      "Все" to null,
+      "Токены" to "Токен / Заголовок",
+      "Cookie" to "Cookie",
+      "Параметры" to "Параметр",
+      "Эндпоинты" to "Эндпоинт",
+    ).forEach { (label, cat) ->
+      bar.addView(
+        OverlayUi.chipButton(ctx, label) {
+          dataCategoryFilter = cat
+          renderExtractedDataTab()
+        }
+      )
+    }
+    bar.addView(
+      OverlayUi.chipButton(ctx, "Копировать всё JSON", accent = true) {
+        val items = OverlayDataExtractor.extractArtifacts(latestTransactions, store.visits.value)
+        if (items.isEmpty()) {
+          Toast.makeText(this, "Пока нет извлечённых данных", Toast.LENGTH_SHORT).show()
+        } else {
+          val arr = JSONArray()
+          items.forEach { art ->
+            arr.put(
+              JSONObject()
+                .put("category", art.category)
+                .put("label", art.label)
+                .put("value", art.value)
+                .put("source", art.sourceHost)
+            )
+          }
+          OverlayUi.copyToClipboard(this, "NetScope Data", arr.toString(2), "Скопировано ${items.size} элементов")
         }
       }
     )
-    bottomRow.addView(
-      smallActionBtn(ctx, "Открыть NetScope") {
-        val current = webView?.url ?: urlEditText?.text?.toString() ?: currentUrl
-        val intent =
-          Intent(Intent.ACTION_VIEW, Uri.parse(normalizeUrl(current))).apply {
-            setPackage(packageName)
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-          }
-        runCatching { startActivity(intent) }
-        setExpanded(false)
+    barScroll.addView(bar)
+    root.addView(barScroll)
+
+    val listCol = LinearLayout(ctx).apply {
+      orientation = LinearLayout.VERTICAL
+      setPadding(0, dp(6), 0, dp(4))
+    }
+    dataListContainer = listCol
+    root.addView(
+      ScrollView(ctx).apply {
+        layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f)
+        addView(listCol)
       }
     )
-    col.addView(bottomRow)
-
-    return col
+    return root
   }
 
-  private fun buildSandboxOverlayShell(ctx: Context): LinearLayout {
-    val sandbox =
-      LinearLayout(ctx).apply {
-        orientation = LinearLayout.VERTICAL
-        layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f)
-      }
+  private fun buildWebViewTab(ctx: Context): LinearLayout {
+    val sandbox = LinearLayout(ctx).apply { orientation = LinearLayout.VERTICAL }
 
     val urlRow =
       LinearLayout(ctx).apply {
         orientation = LinearLayout.HORIZONTAL
         gravity = Gravity.CENTER_VERTICAL
-        setPadding(0, dp(2), 0, dp(4))
+        setPadding(dp(8), dp(6), dp(8), dp(4))
       }
-    val urlField =
-      EditText(ctx).apply {
-        setText(currentUrl)
-        hint = "https://m.vk.com"
-        setTextColor(Color.WHITE)
-        setHintTextColor(Color.GRAY)
-        textSize = 12f
-        inputType = InputType.TYPE_TEXT_VARIATION_URI
-        setSingleLine(true)
-        setPadding(dp(8), dp(6), dp(8), dp(6))
-        background =
-          GradientDrawable().apply {
-            setColor(Color.rgb(23, 33, 52))
-            cornerRadius = dp(8).toFloat()
-          }
-        layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-      }
+    val urlField = OverlayUi.darkInput(ctx, "https://m.vk.com", currentUrl).apply {
+      inputType = InputType.TYPE_TEXT_VARIATION_URI
+      layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply { marginEnd = dp(4) }
+    }
     urlEditText = urlField
-
-    val pasteBtn =
-      smallActionBtn(ctx, "Буфер") {
-        val cm = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
-        val clip = cm.primaryClip?.getItemAt(0)?.coerceToText(this)?.toString().orEmpty()
+    urlRow.addView(urlField)
+    urlRow.addView(
+      OverlayUi.chipButton(ctx, "Буфер") {
+        val clip = OverlayUi.readClipboardText(this)
         val foundUrl = Regex("https?://[^\\s]+").find(clip)?.value ?: clip.trim()
         if (foundUrl.isNotBlank()) {
           val normalized = normalizeUrl(foundUrl)
@@ -755,35 +896,29 @@ class InjectorOverlayService : Service() {
           ensureOverlayWebView(ctx)
           webView?.loadUrl(normalized)
         } else {
-          Toast.makeText(this, "Буфер пуст", Toast.LENGTH_SHORT).show()
+          Toast.makeText(this, "В буфере нет ссылки", Toast.LENGTH_SHORT).show()
         }
       }
-    val goBtn =
-      smallActionBtn(ctx, "Открыть") {
+    )
+    urlRow.addView(
+      OverlayUi.chipButton(ctx, "Открыть", accent = true) {
         val target = normalizeUrl(urlField.text.toString())
         currentUrl = target
         urlField.setText(target)
         ensureOverlayWebView(ctx)
         webView?.loadUrl(target)
       }
-    urlRow.addView(urlField)
-    urlRow.addView(pasteBtn)
-    urlRow.addView(goBtn)
+    )
+    sandbox.addView(urlRow)
 
+    val toolsScroll = HorizontalScrollView(ctx).apply { isHorizontalScrollBarEnabled = false }
     val toolsRow =
       LinearLayout(ctx).apply {
         orientation = LinearLayout.HORIZONTAL
-        setPadding(0, dp(2), 0, dp(6))
+        setPadding(dp(8), dp(2), dp(8), dp(6))
       }
     toolsRow.addView(
-      smallActionBtn(ctx, "Инжект JS") {
-        inspectorBox?.visibility = View.GONE
-        ensureOverlayWebView(ctx)
-        webView?.let { injectActiveScripts(it, force = true, forceShow = true) }
-      }
-    )
-    toolsRow.addView(
-      smallActionBtn(ctx, "Eruda") {
+      OverlayUi.chipButton(ctx, "Eruda", accent = true) {
         inspectorBox?.visibility = View.GONE
         store.updateConfig { it.copy(masterEnabled = true) }
         store.toggleSource("eruda", true)
@@ -793,20 +928,25 @@ class InjectorOverlayService : Service() {
       }
     )
     toolsRow.addView(
-      smallActionBtn(ctx, "Инспектор") {
+      OverlayUi.chipButton(ctx, "Инжект JS") {
+        inspectorBox?.visibility = View.GONE
+        ensureOverlayWebView(ctx)
+        webView?.let { injectActiveScripts(it, force = true, forceShow = true) }
+      }
+    )
+    toolsRow.addView(
+      OverlayUi.chipButton(ctx, "Инспектор") {
         ensureOverlayWebView(ctx)
         webView?.evaluateJavascript(InjectorScripts.JS_INSPECTOR_INFO) { raw ->
           val clean = decodeJsString(raw ?: "{}")
-          val cm = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
-          cm.setPrimaryClip(ClipData.newPlainText("Инспектор", clean))
-          inspectorText?.text = "Скопировано в буфер:\n\n$clean"
-          inspectorBox?.visibility =
-            if (inspectorBox?.visibility == View.VISIBLE) View.GONE else View.VISIBLE
+          OverlayUi.copyToClipboard(this, "Инспектор", clean, "Данные страницы скопированы")
+          inspectorText?.text = clean
+          inspectorBox?.visibility = if (inspectorBox?.visibility == View.VISIBLE) View.GONE else View.VISIBLE
         }
       }
     )
     toolsRow.addView(
-      smallActionBtn(ctx, "В NetScope") {
+      OverlayUi.chipButton(ctx, "В NetScope") {
         val current = webView?.url ?: urlField.text.toString()
         val intent =
           Intent(Intent.ACTION_VIEW, Uri.parse(normalizeUrl(current))).apply {
@@ -817,39 +957,391 @@ class InjectorOverlayService : Service() {
         setExpanded(false)
       }
     )
+    toolsScroll.addView(toolsRow)
+    sandbox.addView(toolsScroll)
 
     val inspTxt =
       TextView(ctx).apply {
-        setTextColor(Color.rgb(16, 185, 129))
+        setTextColor(OverlayPalette.greenOk)
         textSize = 10.5f
         typeface = Typeface.MONOSPACE
+        setTextIsSelectable(true)
         setPadding(dp(8), dp(6), dp(8), dp(6))
       }
     inspectorText = inspTxt
     val inspScroll =
       ScrollView(ctx).apply {
         visibility = View.GONE
-        background =
-          GradientDrawable().apply {
-            setColor(Color.rgb(8, 13, 24))
-            cornerRadius = dp(8).toFloat()
-          }
+        setBackgroundColor(OverlayPalette.bgInput)
         layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(100))
         addView(inspTxt)
       }
     inspectorBox = inspScroll
+    sandbox.addView(inspScroll)
 
     val wvContainer =
       FrameLayout(ctx).apply {
         layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f)
       }
     webViewContainer = wvContainer
-
-    sandbox.addView(urlRow)
-    sandbox.addView(toolsRow)
-    sandbox.addView(inspScroll)
     sandbox.addView(wvContainer)
+
     return sandbox
+  }
+
+  private fun buildSettingsTab(ctx: Context): ScrollView {
+    val col =
+      LinearLayout(ctx).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(dp(10), dp(6), dp(10), dp(12))
+      }
+    val cfg = store.config.value
+
+    col.addView(OverlayUi.sectionHeader(ctx, "Параметры инъекции (обход CSP)"))
+    col.addView(
+      OverlayUi.switchRow(ctx, "Авто-инжект JS при загрузке", cfg.masterEnabled) { checked ->
+        store.updateConfig { it.copy(masterEnabled = checked) }
+      }
+    )
+    col.addView(
+      OverlayUi.switchRow(ctx, "Разблокировать выделение текста", cfg.unlockSelection) { checked ->
+        store.updateConfig { it.copy(unlockSelection = checked) }
+      }
+    )
+    col.addView(
+      OverlayUi.switchRow(ctx, "Разрешить пинч-зум (до 6x)", cfg.forceZoom) { checked ->
+        store.updateConfig { it.copy(forceZoom = checked) }
+      }
+    )
+    col.addView(
+      OverlayUi.switchRow(ctx, "Удалённая отладка (chrome://inspect)", cfg.remoteDebug) { checked ->
+        store.updateConfig { it.copy(remoteDebug = checked) }
+        runCatching { WebView.setWebContentsDebuggingEnabled(checked) }
+      }
+    )
+    col.addView(
+      OverlayUi.switchRow(ctx, "Логировать URL и initData", cfg.logVisits) { checked ->
+        store.updateConfig { it.copy(logVisits = checked) }
+      }
+    )
+
+    col.addView(OverlayUi.sectionHeader(ctx, "Показ поверх ВК и приложений"))
+    col.addView(
+      OverlayUi.switchRow(ctx, "Показывать только в списке ниже", cfg.overlayOnlyInTargets) { checked ->
+        onlyInTargets = checked
+        store.updateConfig { it.copy(overlayOnlyInTargets = checked) }
+        startAsForeground()
+        startForegroundWatcher()
+      }
+    )
+
+    val pkgInput = OverlayUi.darkInput(ctx, DEFAULT_VK_PACKAGES, cfg.overlayTargetPackages.ifBlank { DEFAULT_VK_PACKAGES })
+    col.addView(pkgInput)
+
+    val pkgBtnRow =
+      LinearLayout(ctx).apply {
+        orientation = LinearLayout.HORIZONTAL
+        setPadding(0, dp(6), 0, dp(4))
+      }
+    pkgBtnRow.addView(
+      OverlayUi.chipButton(ctx, "Сохранить пакеты") {
+        val raw = pkgInput.text.toString().trim().ifBlank { DEFAULT_VK_PACKAGES }
+        store.updateConfig { it.copy(overlayTargetPackages = raw) }
+        targetPackages = raw.split(',', ';', ' ').map { it.trim().lowercase() }.filter { it.isNotBlank() }.toSet()
+        Toast.makeText(this, "Список пакетов сохранён", Toast.LENGTH_SHORT).show()
+        startForegroundWatcher()
+      }
+    )
+    pkgBtnRow.addView(
+      OverlayUi.chipButton(ctx, if (hasUsageAccess(this)) "Статистика: ОК" else "Доступ к статистике") {
+        runCatching {
+          startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+        }
+        setExpanded(false)
+      }
+    )
+    col.addView(pkgBtnRow)
+
+    col.addView(OverlayUi.sectionHeader(ctx, "Источники JS (Eruda / vConsole / Офлайн)"))
+    val srcListLayout = LinearLayout(ctx).apply { orientation = LinearLayout.VERTICAL }
+    sourcesContainer = srcListLayout
+    col.addView(srcListLayout)
+    renderSourcesList()
+
+    val addUrlEdit = OverlayUi.darkInput(ctx, "Своя JS-ссылка: https://cdn.../script.js").apply {
+      inputType = InputType.TYPE_TEXT_VARIATION_URI
+    }
+    val initEdit = OverlayUi.darkInput(ctx, "Код запуска (напр. eruda.init();)").apply {
+      layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+        topMargin = dp(4)
+      }
+    }
+    val trustCheck =
+      CheckBox(ctx).apply {
+        text = "Подтверждаю доверие добавляемому JS-скрипту"
+        setTextColor(OverlayPalette.textPrimary)
+        textSize = 11f
+        isChecked = store.config.value.disclaimerAccepted
+      }
+    col.addView(addUrlEdit)
+    col.addView(initEdit)
+    col.addView(trustCheck)
+    col.addView(
+      OverlayUi.chipButton(ctx, "Добавить и скачать JS", accent = true) {
+        val url = addUrlEdit.text.toString().trim()
+        if (!url.startsWith("http://") && !url.startsWith("https://")) {
+          Toast.makeText(this, "Введите корректный http(s) URL", Toast.LENGTH_SHORT).show()
+          return@chipButton
+        }
+        if (!trustCheck.isChecked) {
+          Toast.makeText(this, "Подтвердите доверие скрипту", Toast.LENGTH_SHORT).show()
+          return@chipButton
+        }
+        store.updateConfig { it.copy(disclaimerAccepted = true) }
+        val added = store.addCustomSource(url, initEdit.text.toString())
+        addUrlEdit.setText("")
+        initEdit.setText("")
+        renderSourcesList()
+        scope.launch {
+          store.fetchAndCacheSource(added).onSuccess { bytes ->
+            Toast.makeText(this@InjectorOverlayService, "Загружено ${added.name} (${bytes / 1024} КБ)", Toast.LENGTH_SHORT).show()
+            renderSourcesList()
+          }.onFailure { err ->
+            Toast.makeText(this@InjectorOverlayService, "Ошибка: ${err.message}", Toast.LENGTH_LONG).show()
+          }
+        }
+      }
+    )
+
+    col.addView(OverlayUi.sectionHeader(ctx, "Очистка и запуск"))
+    val actRow = LinearLayout(ctx).apply { orientation = LinearLayout.HORIZONTAL }
+    actRow.addView(
+      OverlayUi.chipButton(ctx, "Очистить WebView") {
+        runCatching {
+          CookieManager.getInstance().removeAllCookies(null)
+          CookieManager.getInstance().flush()
+          WebStorage.getInstance().deleteAllData()
+          webView?.clearCache(true)
+          Toast.makeText(this, "Cookies и кэш очищены", Toast.LENGTH_SHORT).show()
+        }
+      }
+    )
+    actRow.addView(
+      OverlayUi.chipButton(ctx, "Открыть NetScope") {
+        packageManager.getLaunchIntentForPackage(packageName)?.apply {
+          addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+          startActivity(this)
+        }
+        setExpanded(false)
+      }
+    )
+    col.addView(actRow)
+
+    return ScrollView(ctx).apply { addView(col) }
+  }
+
+  private fun observeLiveTrafficAndVpn() {
+    ipcJob?.cancel()
+    ipcJob =
+      scope.launch {
+        ProxyIpcBridge.recentTransactions.collectLatest { list ->
+          latestTransactions = list
+          if (!isNetworkPaused && activeTab == 0) {
+            renderNetworkTable()
+          } else if (activeTab == 2) {
+            renderExtractedDataTab()
+          }
+        }
+      }
+    vpnJob?.cancel()
+    vpnJob =
+      scope.launch {
+        ProxyIpcBridge.vpnStatus.collectLatest { status ->
+          updateVpnUi(status.isRunning)
+        }
+      }
+  }
+
+  private fun updateVpnUi(running: Boolean) {
+    vpnStatusBadge?.apply {
+      text = if (running) "● VPN" else "○ Вкл. VPN"
+      setTextColor(if (running) OverlayPalette.greenOk else OverlayPalette.amberWarn)
+    }
+    vpnHintBanner?.visibility = if (running) View.GONE else View.VISIBLE
+  }
+
+  private fun startOrOpenVpn() {
+    if (ProxyIpcBridge.vpnStatus.value.isRunning) {
+      Toast.makeText(this, "Локальный VPN-перехват уже активен", Toast.LENGTH_SHORT).show()
+      return
+    }
+    val prep = VpnService.prepare(this)
+    if (prep == null) {
+      val caInstalled = runCatching { CaCertificateManager(this).isCaInstalledInUserStore() }.getOrDefault(false)
+      val intent =
+        NetScopeVpnService.startIntent(
+          context = this,
+          sessionId = UUID.randomUUID().toString(),
+          mitmEnabled = caInstalled,
+          pinningCompat = true,
+        )
+      startForegroundService(intent)
+      Toast.makeText(this, "Запуск локального VPN-перехвата...", Toast.LENGTH_SHORT).show()
+    } else {
+      Toast.makeText(this, "Подтвердите запуск VPN в приложении NetScope", Toast.LENGTH_LONG).show()
+      packageManager.getLaunchIntentForPackage(packageName)?.apply {
+        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        startActivity(this)
+      }
+      setExpanded(false)
+    }
+  }
+
+  private fun filteredTransactions(): List<CapturedTransaction> {
+    val q = networkSearchQuery.trim()
+    return latestTransactions.filter { tx ->
+      val vkOk = !vkFilterEnabled || OverlayDataExtractor.isVkRelatedTransaction(tx, targetPackages)
+      val queryOk =
+        q.isBlank() ||
+          tx.fullUrl.contains(q, ignoreCase = true) ||
+          tx.host.contains(q, ignoreCase = true) ||
+          tx.method.name.contains(q, ignoreCase = true) ||
+          tx.responseBody.contains(q, ignoreCase = true)
+      vkOk && queryOk
+    }
+  }
+
+  private fun renderNetworkTable() {
+    val listContainer = networkListContainer ?: return
+    val ctx = listContainer.context
+    val currentDetail = selectedTx
+
+    if (currentDetail != null) {
+      networkTableHeader?.visibility = View.GONE
+      networkListScroll?.visibility = View.GONE
+      networkDetailBox?.visibility = View.VISIBLE
+      networkDetailText?.text = OverlayDataExtractor.buildTransactionDump(currentDetail)
+      return
+    }
+
+    networkDetailBox?.visibility = View.GONE
+    networkTableHeader?.visibility = View.VISIBLE
+    networkListScroll?.visibility = View.VISIBLE
+    listContainer.removeAllViews()
+
+    val rows = filteredTransactions()
+    if (rows.isEmpty()) {
+      val emptyBox =
+        LinearLayout(ctx).apply {
+          orientation = LinearLayout.VERTICAL
+          gravity = Gravity.CENTER_HORIZONTAL
+          setPadding(dp(16), dp(20), dp(16), dp(16))
+        }
+      emptyBox.addView(
+        TextView(ctx).apply {
+          text =
+            "Запросов пока нет.\nОткройте мини-аппку или ленту в ВК при активном VPN — или загрузите её во вкладке WebView."
+          setTextColor(OverlayPalette.textMuted)
+          textSize = 11.5f
+          gravity = Gravity.CENTER
+        }
+      )
+      emptyBox.addView(
+        OverlayUi.chipButton(ctx, "Открыть WebView + Eruda", accent = true) { selectOverlayTab(3) }.apply {
+          layoutParams =
+            LinearLayout.LayoutParams(
+              LinearLayout.LayoutParams.WRAP_CONTENT,
+              LinearLayout.LayoutParams.WRAP_CONTENT,
+            ).apply { topMargin = dp(10) }
+        }
+      )
+      listContainer.addView(emptyBox)
+      return
+    }
+
+    rows.take(80).forEachIndexed { idx, tx ->
+      listContainer.addView(
+        OverlayUi.buildNetworkTableRow(ctx, tx, idx) {
+          selectedTx = tx
+          renderNetworkTable()
+        }
+      )
+    }
+  }
+
+  private fun renderExtractedDataTab() {
+    val container = dataListContainer ?: return
+    val ctx = container.context
+    container.removeAllViews()
+
+    val all = OverlayDataExtractor.extractArtifacts(latestTransactions, store.visits.value)
+    val items = if (dataCategoryFilter == null) all else all.filter { it.category == dataCategoryFilter }
+
+    if (items.isEmpty()) {
+      container.addView(
+        TextView(ctx).apply {
+          text = "Токены, куки и initData появятся здесь автоматически после захвата запросов в «Сеть» или «WebView»."
+          setTextColor(OverlayPalette.textMuted)
+          textSize = 11.5f
+          setPadding(dp(8), dp(14), dp(8), dp(8))
+        }
+      )
+      return
+    }
+
+    items.take(60).forEach { art ->
+      val card =
+        LinearLayout(ctx).apply {
+          orientation = LinearLayout.VERTICAL
+          setPadding(dp(8), dp(6), dp(8), dp(6))
+          background =
+            GradientDrawable().apply {
+              setColor(OverlayPalette.bgRowAlt)
+              cornerRadius = dp(6).toFloat()
+              setStroke(dp(1), OverlayPalette.border)
+            }
+          layoutParams =
+            LinearLayout.LayoutParams(
+              LinearLayout.LayoutParams.MATCH_PARENT,
+              LinearLayout.LayoutParams.WRAP_CONTENT,
+            ).apply { bottomMargin = dp(6) }
+        }
+      val topRow =
+        LinearLayout(ctx).apply {
+          orientation = LinearLayout.HORIZONTAL
+          gravity = Gravity.CENTER_VERTICAL
+        }
+      topRow.addView(
+        TextView(ctx).apply {
+          text = "[${art.category}] ${art.label}"
+          setTextColor(OverlayPalette.accentCyan)
+          textSize = 11f
+          setTypeface(null, Typeface.BOLD)
+          maxLines = 1
+          ellipsize = TextUtils.TruncateAt.END
+          layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        }
+      )
+      topRow.addView(
+        OverlayUi.chipButton(ctx, "Копировать") {
+          OverlayUi.copyToClipboard(this, art.label, art.value, "${art.label} скопирован")
+        }
+      )
+      card.addView(topRow)
+      card.addView(
+        TextView(ctx).apply {
+          text = art.value
+          setTextColor(OverlayPalette.textPrimary)
+          textSize = 10.5f
+          typeface = Typeface.MONOSPACE
+          maxLines = 3
+          ellipsize = TextUtils.TruncateAt.END
+          setTextIsSelectable(true)
+          setPadding(0, dp(3), 0, 0)
+        }
+      )
+      container.addView(card)
+    }
   }
 
   @SuppressLint("SetJavaScriptEnabled")
@@ -867,16 +1359,13 @@ class InjectorOverlayService : Service() {
       webView = createdWv
       container.addView(
         createdWv,
-        FrameLayout.LayoutParams(
-          FrameLayout.LayoutParams.MATCH_PARENT,
-          FrameLayout.LayoutParams.MATCH_PARENT,
-        ),
+        FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT),
       )
       createdWv.loadUrl(normalizeUrl(urlEditText?.text?.toString() ?: currentUrl))
     } else {
       container.addView(
         TextView(ctx).apply {
-          text = "WebView недоступен в фоновом окне на этой прошивке. Нажмите «В NetScope» для открытия встроенной песочницы."
+          text = "WebView недоступен в фоновом окне на этой прошивке. Нажмите «В NetScope»."
           setTextColor(Color.WHITE)
           setPadding(dp(12), dp(12), dp(12), dp(12))
         }
@@ -896,6 +1385,7 @@ class InjectorOverlayService : Service() {
         displayZoomControls = false
         mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
       }
+      addJavascriptInterface(WebViewNetworkBridge(), "__nsNativeBridge")
       webChromeClient = WebChromeClient()
       webViewClient =
         object : WebViewClient() {
@@ -904,7 +1394,10 @@ class InjectorOverlayService : Service() {
               currentUrl = url
               urlEditText?.setText(url)
             }
-            if (view != null) probeAndInject(view)
+            if (view != null) {
+              view.evaluateJavascript(InjectorScripts.JS_NETWORK_BRIDGE_HOOK, null)
+              probeAndInject(view)
+            }
           }
 
           override fun onLoadResource(view: WebView?, url: String?) {
@@ -913,6 +1406,7 @@ class InjectorOverlayService : Service() {
 
           override fun onPageFinished(view: WebView?, url: String?) {
             if (view != null) {
+              view.evaluateJavascript(InjectorScripts.JS_NETWORK_BRIDGE_HOOK, null)
               probeAndInject(view)
               if (store.config.value.logVisits && !url.isNullOrBlank()) {
                 store.logVisit(url, view.title.orEmpty())
@@ -920,17 +1414,13 @@ class InjectorOverlayService : Service() {
             }
           }
 
-          override fun shouldOverrideUrlLoading(
-            view: WebView?,
-            request: WebResourceRequest?,
-          ): Boolean {
+          override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
             val u = request?.url?.toString().orEmpty()
             return !(u.startsWith("http://") || u.startsWith("https://"))
           }
         }
     }
 
-  @SuppressLint("UseSwitchCompatOrMaterialCode")
   private fun renderSourcesList() {
     val container = sourcesContainer ?: return
     val ctx = container.context
@@ -943,8 +1433,8 @@ class InjectorOverlayService : Service() {
           setPadding(dp(8), dp(6), dp(8), dp(6))
           background =
             GradientDrawable().apply {
-              setColor(Color.rgb(20, 29, 46))
-              cornerRadius = dp(8).toFloat()
+              setColor(OverlayPalette.bgRowAlt)
+              cornerRadius = dp(6).toFloat()
             }
           layoutParams =
             LinearLayout.LayoutParams(
@@ -952,7 +1442,6 @@ class InjectorOverlayService : Service() {
               LinearLayout.LayoutParams.WRAP_CONTENT,
             ).apply { bottomMargin = dp(5) }
         }
-
       val infoCol =
         LinearLayout(ctx).apply {
           orientation = LinearLayout.VERTICAL
@@ -962,7 +1451,7 @@ class InjectorOverlayService : Service() {
         TextView(ctx).apply {
           text = src.name
           setTextColor(Color.WHITE)
-          textSize = 12f
+          textSize = 11.5f
           setTypeface(null, Typeface.BOLD)
           maxLines = 1
           ellipsize = TextUtils.TruncateAt.END
@@ -972,93 +1461,77 @@ class InjectorOverlayService : Service() {
         TextView(ctx).apply {
           text =
             when {
-              src.id == InjectorScripts.LOCAL_CONSOLE_ID -> "Всегда готов • без интернета"
-              src.cachedBytes > 0 -> "В кэше: ${src.cachedBytes / 1024} КБ"
+              src.id == InjectorScripts.LOCAL_CONSOLE_ID -> "Встроено • без интернета"
+              src.cachedBytes > 0 -> "Кэш: ${src.cachedBytes / 1024} КБ"
               else -> "Не скачан • CDN"
             }
-          setTextColor(
-            if (src.cachedBytes > 0) Color.rgb(16, 185, 129) else Color.rgb(148, 163, 184)
-          )
-          textSize = 10.5f
+          setTextColor(if (src.cachedBytes > 0) OverlayPalette.greenOk else OverlayPalette.textMuted)
+          textSize = 10f
         }
       )
-
-      val dlBtn =
-        smallActionBtn(ctx, "Кэш") {
-          scope.launch {
-            store.fetchAndCacheSource(src).onSuccess { bytes ->
-              Toast.makeText(
-                this@InjectorOverlayService,
-                "Кэшировано ${src.name}: ${bytes / 1024} КБ",
-                Toast.LENGTH_SHORT,
-              ).show()
-              renderSourcesList()
-            }.onFailure { err ->
-              Toast.makeText(
-                this@InjectorOverlayService,
-                "Ошибка: ${err.message}",
-                Toast.LENGTH_SHORT,
-              ).show()
-            }
-          }
-        }
-
-      val toggle =
-        Switch(ctx).apply {
-          isChecked = src.enabled
-          setOnCheckedChangeListener { _, isChecked ->
-            store.toggleSource(src.id, isChecked)
-            if (isChecked && store.getCachedScript(src.id) == null) {
-              scope.launch {
-                store.fetchAndCacheSource(src).onSuccess {
-                  renderSourcesList()
-                }
+      row.addView(infoCol)
+      if (src.id != InjectorScripts.LOCAL_CONSOLE_ID) {
+        row.addView(
+          OverlayUi.chipButton(ctx, "Кэш") {
+            scope.launch {
+              store.fetchAndCacheSource(src).onSuccess { bytes ->
+                Toast.makeText(this@InjectorOverlayService, "Кэш ${src.name}: ${bytes / 1024} КБ", Toast.LENGTH_SHORT).show()
+                renderSourcesList()
+              }.onFailure { err ->
+                Toast.makeText(this@InjectorOverlayService, "Ошибка: ${err.message}", Toast.LENGTH_SHORT).show()
               }
             }
           }
-        }
-
-      row.addView(infoCol)
-      if (src.id != InjectorScripts.LOCAL_CONSOLE_ID) {
-        row.addView(dlBtn)
-      }
-      if (src.id !in setOf("eruda", "vconsole", InjectorScripts.LOCAL_CONSOLE_ID)) {
-        row.addView(
-          smallActionBtn(ctx, "×") {
-            store.removeSource(src.id)
-            renderSourcesList()
-          }
         )
       }
-      row.addView(toggle)
+      val stateBtn =
+        OverlayUi.chipButton(ctx, if (src.enabled) "ВКЛ" else "ВЫКЛ", accent = src.enabled) {
+          val next = !src.enabled
+          store.toggleSource(src.id, next)
+          renderSourcesList()
+          if (next && store.getCachedScript(src.id) == null) {
+            scope.launch {
+              store.fetchAndCacheSource(src).onSuccess { renderSourcesList() }
+            }
+          }
+        }
+      row.addView(stateBtn)
       container.addView(row)
     }
   }
 
   private fun selectOverlayTab(index: Int) {
-    activeOverlayTab = index
-    settingsScroll?.visibility = if (index == 0) View.VISIBLE else View.GONE
-    sandboxColumn?.visibility = if (index == 1) View.VISIBLE else View.GONE
+    activeTab = index
+    val ctx = panelView?.context ?: this
+    tabButtons.forEachIndexed { idx, btn -> OverlayUi.styleTabButton(ctx, btn, idx == index) }
+    tabPanels.forEachIndexed { idx, view -> view.visibility = if (idx == index) View.VISIBLE else View.GONE }
 
-    if (index == 1) {
-      sandboxColumn?.context?.let { ensureOverlayWebView(it) }
+    when (index) {
+      0 -> renderNetworkTable()
+      2 -> renderExtractedDataTab()
+      3 -> ensureOverlayWebView(ctx)
+      4 -> renderSourcesList()
     }
+  }
 
-    tabSettingsBtn?.apply {
-      background =
-        GradientDrawable().apply {
-          setColor(if (index == 0) Color.rgb(0, 229, 255) else Color.rgb(30, 41, 59))
-          cornerRadius = dp(8).toFloat()
-        }
-      setTextColor(if (index == 0) Color.rgb(6, 12, 22) else Color.WHITE)
-    }
-    tabSandboxBtn?.apply {
-      background =
-        GradientDrawable().apply {
-          setColor(if (index == 1) Color.rgb(0, 229, 255) else Color.rgb(30, 41, 59))
-          cornerRadius = dp(8).toFloat()
-        }
-      setTextColor(if (index == 1) Color.rgb(6, 12, 22) else Color.WHITE)
+  private fun computePanelHeight(): Int {
+    val screenH = resources.displayMetrics.heightPixels
+    val ratio = if (isTallMode) 0.85f else 0.62f
+    return (screenH * ratio).toInt().coerceIn(dp(340), screenH - dp(48))
+  }
+
+  private fun updateExpandedLayout() {
+    val params = layoutParams ?: return
+    val panel = panelView ?: return
+    val h = computePanelHeight()
+    panel.layoutParams = FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, h)
+    if (isExpanded) {
+      params.width = WindowManager.LayoutParams.MATCH_PARENT
+      params.height = h
+      params.gravity = Gravity.BOTTOM or Gravity.START
+      params.x = 0
+      params.y = 0
+      runCatching { containerView?.let { windowManager?.updateViewLayout(it, params) } }
     }
   }
 
@@ -1066,14 +1539,26 @@ class InjectorOverlayService : Service() {
     isExpanded = expand
     bubbleView?.visibility = if (expand) View.GONE else View.VISIBLE
     panelView?.visibility = if (expand) View.VISIBLE else View.GONE
-    if (expand) renderSourcesList()
     val params = layoutParams ?: return
-    params.flags =
-      if (expand) {
-        WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
-      } else {
-        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-      }
+    if (expand) {
+      val h = computePanelHeight()
+      panelView?.layoutParams = FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, h)
+      params.width = WindowManager.LayoutParams.MATCH_PARENT
+      params.height = h
+      params.gravity = Gravity.BOTTOM or Gravity.START
+      params.x = 0
+      params.y = 0
+      params.flags = WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+      updateVpnUi(ProxyIpcBridge.vpnStatus.value.isRunning)
+      selectOverlayTab(activeTab)
+    } else {
+      params.width = WindowManager.LayoutParams.WRAP_CONTENT
+      params.height = WindowManager.LayoutParams.WRAP_CONTENT
+      params.gravity = Gravity.TOP or Gravity.START
+      params.x = bubbleX
+      params.y = bubbleY
+      params.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+    }
     runCatching { containerView?.let { windowManager?.updateViewLayout(it, params) } }
   }
 
@@ -1104,47 +1589,28 @@ class InjectorOverlayService : Service() {
       val js = store.getCachedScript(src.id)
       if (js == null) {
         missing = true
-        // Сразу показываем офлайн-консоль, пока качается CDN-скрипт
         view.evaluateJavascript(
           InjectorScripts.buildInjectPayload(InjectorScripts.BUILTIN_DEVTOOLS_JS, "", forceShow),
           null,
         )
         scope.launch {
           store.fetchAndCacheSource(src).onSuccess { bytes ->
-            Toast.makeText(
-              this@InjectorOverlayService,
-              "Загружено ${src.name} (${bytes / 1024} КБ)",
-              Toast.LENGTH_SHORT,
-            ).show()
+            Toast.makeText(this@InjectorOverlayService, "Загружено ${src.name} (${bytes / 1024} КБ)", Toast.LENGTH_SHORT).show()
             renderSourcesList()
-            val downloaded = store.getCachedScript(src.id)
-            if (downloaded != null) {
-              view.evaluateJavascript(
-                InjectorScripts.buildInjectPayload(downloaded, src.initCode, forceShow),
-                null,
-              )
+            store.getCachedScript(src.id)?.let { downloaded ->
+              view.evaluateJavascript(InjectorScripts.buildInjectPayload(downloaded, src.initCode, forceShow), null)
             }
           }.onFailure { err ->
-            Toast.makeText(
-              this@InjectorOverlayService,
-              "CDN недоступен (${err.message}), запущена встроенная консоль",
-              Toast.LENGTH_LONG,
-            ).show()
+            Toast.makeText(this@InjectorOverlayService, "CDN недоступен (${err.message}), запущена встроенная консоль", Toast.LENGTH_LONG).show()
           }
         }
       } else {
         view.evaluateJavascript(InjectorScripts.buildInjectPayload(js, src.initCode, forceShow), null)
       }
     }
-    if (cfg.unlockSelection) {
-      view.evaluateJavascript(InjectorScripts.JS_UNLOCK_SELECTION, null)
-    }
-    if (cfg.forceZoom) {
-      view.evaluateJavascript(InjectorScripts.JS_FORCE_ZOOM, null)
-    }
-    if (!missing) {
-      view.evaluateJavascript("window.__bma=1;", null)
-    }
+    if (cfg.unlockSelection) view.evaluateJavascript(InjectorScripts.JS_UNLOCK_SELECTION, null)
+    if (cfg.forceZoom) view.evaluateJavascript(InjectorScripts.JS_FORCE_ZOOM, null)
+    if (!missing) view.evaluateJavascript("window.__bma=1;", null)
   }
 
   private fun startForegroundWatcher() {
@@ -1166,11 +1632,11 @@ class InjectorOverlayService : Service() {
             val ev = UsageEvents.Event()
             while (events.hasNextEvent()) {
               events.getNextEvent(ev)
-              val isForegroundEvent =
+              val isFg =
                 ev.eventType == UsageEvents.Event.ACTIVITY_RESUMED ||
                   @Suppress("DEPRECATION") (ev.eventType == UsageEvents.Event.MOVE_TO_FOREGROUND)
               val pkg = ev.packageName?.lowercase().orEmpty()
-              if (isForegroundEvent && pkg.isNotBlank() && pkg !in IGNORED_TRANSIENT_PACKAGES) {
+              if (isFg && pkg.isNotBlank() && pkg !in IGNORED_TRANSIENT_PACKAGES) {
                 lastForegroundPkg = pkg
               }
             }
@@ -1178,75 +1644,12 @@ class InjectorOverlayService : Service() {
           if (isExpanded) {
             containerView?.visibility = View.VISIBLE
           } else if (lastForegroundPkg.isNotBlank()) {
-            val shouldShow = lastForegroundPkg in targetPackages
-            containerView?.visibility = if (shouldShow) View.VISIBLE else View.GONE
+            containerView?.visibility = if (lastForegroundPkg in targetPackages) View.VISIBLE else View.GONE
           }
           delay(1000L)
         }
       }
   }
-
-  private fun sectionHeader(ctx: Context, title: String): TextView =
-    TextView(ctx).apply {
-      text = title
-      setTextColor(Color.rgb(103, 232, 249))
-      textSize = 12f
-      setTypeface(null, Typeface.BOLD)
-      setPadding(0, dp(8), 0, dp(4))
-    }
-
-  @SuppressLint("UseSwitchCompatOrMaterialCode")
-  private fun switchRow(
-    ctx: Context,
-    label: String,
-    initial: Boolean,
-    onChanged: (Boolean) -> Unit,
-  ): LinearLayout =
-    LinearLayout(ctx).apply {
-      orientation = LinearLayout.HORIZONTAL
-      gravity = Gravity.CENTER_VERTICAL
-      setPadding(0, dp(4), 0, dp(4))
-      addView(
-        TextView(ctx).apply {
-          text = label
-          setTextColor(Color.WHITE)
-          textSize = 12f
-          layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-        }
-      )
-      addView(
-        Switch(ctx).apply {
-          isChecked = initial
-          setOnCheckedChangeListener { _, isChecked -> onChanged(isChecked) }
-        }
-      )
-    }
-
-  private fun smallActionBtn(ctx: Context, label: String, onClick: () -> Unit): Button =
-    Button(ctx).apply {
-      text = label
-      textSize = 10.5f
-      setTextColor(Color.WHITE)
-      setAllCaps(false)
-      setPadding(dp(8), dp(2), dp(8), dp(2))
-      minimumHeight = dp(32)
-      minHeight = dp(32)
-      minimumWidth = 0
-      minWidth = 0
-      background =
-        GradientDrawable().apply {
-          setColor(Color.rgb(30, 41, 59))
-          cornerRadius = dp(6).toFloat()
-        }
-      layoutParams =
-        LinearLayout.LayoutParams(
-          LinearLayout.LayoutParams.WRAP_CONTENT,
-          LinearLayout.LayoutParams.WRAP_CONTENT,
-        ).apply {
-          marginEnd = dp(4)
-        }
-      setOnClickListener { onClick() }
-    }
 
   private fun normalizeUrl(input: String): String {
     val trimmed = input.trim()
@@ -1267,6 +1670,8 @@ class InjectorOverlayService : Service() {
   private fun cleanupAndStop() {
     _runningState.value = false
     watcherJob?.cancel()
+    ipcJob?.cancel()
+    vpnJob?.cancel()
     runCatching { webView?.destroy() }
     webView = null
     containerView?.let { runCatching { windowManager?.removeView(it) } }
@@ -1278,6 +1683,8 @@ class InjectorOverlayService : Service() {
   override fun onDestroy() {
     _runningState.value = false
     watcherJob?.cancel()
+    ipcJob?.cancel()
+    vpnJob?.cancel()
     runCatching { webView?.destroy() }
     containerView?.let { runCatching { windowManager?.removeView(it) } }
     scope.cancel()

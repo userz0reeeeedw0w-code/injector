@@ -84,10 +84,115 @@ object InjectorScripts {
       "},null,2);}catch(e){return 'err: '+e;}})();"
 
   /**
-   * Встроенная автономная DevTools-консоль (работает 100% без CDN и при жёстком CSP):
-   * перехватывает console.log/warn/error, fetch, XMLHttpRequest, cookies/localStorage и позволяет выполнять JS.
+   * Лёгкий JS-перехватчик fetch + XMLHttpRequest для моста WebView -> NetScope (без показа UI).
    */
-  const val BUILTIN_DEVTOOLS_JS =
+  const val JS_NETWORK_BRIDGE_HOOK =
+    """
+    (function(){
+      try {
+        if (window.__nsNetHooked) return;
+        window.__nsNetHooked = true;
+        window.__nsNetRecords = window.__nsNetRecords || [];
+        function shortName(u) {
+          try {
+            var p = new URL(u, location.href).pathname.replace(/\/+$/,'').split('/');
+            return (p[p.length-1] || new URL(u, location.href).hostname || u).slice(0,28);
+          } catch(_) { return String(u).slice(0,28); }
+        }
+        function emitNet(rec) {
+          try {
+            window.__nsNetRecords.unshift(rec);
+            if (window.__nsNetRecords.length > 100) window.__nsNetRecords.pop();
+            if (window.__nsUpdateNetUI) window.__nsUpdateNetUI();
+            if (window.__nsNativeBridge && window.__nsNativeBridge.onNetwork) {
+              window.__nsNativeBridge.onNetwork(JSON.stringify(rec));
+            }
+          } catch(_){}
+        }
+        if (window.fetch) {
+          var _origFetch = window.fetch;
+          window.fetch = function(input, init) {
+            var t0 = Date.now();
+            var url = typeof input === 'string' ? input : (input && input.url) || '';
+            var method = ((init && init.method) || (input && input.method) || 'GET').toUpperCase();
+            var reqHeaders = (init && init.headers) ? init.headers : {};
+            var reqBody = (init && init.body) ? String(init.body) : '';
+            return _origFetch.apply(this, arguments).then(function(resp) {
+              var dt = Date.now() - t0;
+              var ct = '';
+              try { ct = resp.headers.get('content-type') || ''; } catch(_){}
+              try {
+                resp.clone().text().then(function(txt) {
+                  emitNet({
+                    name: shortName(url), url: url, method: method,
+                    status: resp.status || 0, ct: ct, size: txt ? txt.length : 0,
+                    time: dt, reqHeaders: reqHeaders, reqBody: reqBody, respBody: txt.slice(0, 12000)
+                  });
+                }).catch(function() {
+                  emitNet({
+                    name: shortName(url), url: url, method: method,
+                    status: resp.status || 0, ct: ct, size: 0,
+                    time: dt, reqHeaders: reqHeaders, reqBody: reqBody, respBody: ''
+                  });
+                });
+              } catch(_) {}
+              return resp;
+            }).catch(function(err) {
+              emitNet({
+                name: shortName(url), url: url, method: method,
+                status: 0, ct: 'err', size: 0, time: Date.now() - t0,
+                reqHeaders: reqHeaders, reqBody: reqBody, respBody: String(err)
+              });
+              throw err;
+            });
+          };
+        }
+        if (window.XMLHttpRequest) {
+          var _open = XMLHttpRequest.prototype.open;
+          var _send = XMLHttpRequest.prototype.send;
+          var _setH = XMLHttpRequest.prototype.setRequestHeader;
+          XMLHttpRequest.prototype.open = function(m, u) {
+            this.__ns = { method: (m || 'GET').toUpperCase(), url: String(u || ''), headers: {} };
+            return _open.apply(this, arguments);
+          };
+          XMLHttpRequest.prototype.setRequestHeader = function(k, v) {
+            if (this.__ns) this.__ns.headers[k] = v;
+            return _setH.apply(this, arguments);
+          };
+          XMLHttpRequest.prototype.send = function(body) {
+            var self = this;
+            if (self.__ns) {
+              self.__ns.t0 = Date.now();
+              self.__ns.body = body ? String(body) : '';
+              self.addEventListener('loadend', function() {
+                try {
+                  var dt = Date.now() - (self.__ns.t0 || Date.now());
+                  var ct = self.getResponseHeader('content-type') || '';
+                  var txt = '';
+                  if (!self.responseType || self.responseType === 'text' || self.responseType === 'json') {
+                    txt = typeof self.responseText === 'string' ? self.responseText : '';
+                  }
+                  emitNet({
+                    name: shortName(self.__ns.url), url: self.__ns.url, method: self.__ns.method,
+                    status: self.status || 0, ct: ct, size: txt ? txt.length : 0,
+                    time: dt, reqHeaders: self.__ns.headers, reqBody: self.__ns.body, respBody: txt.slice(0, 12000)
+                  });
+                } catch(_){}
+              });
+            }
+            return _send.apply(this, arguments);
+          };
+        }
+      } catch(e) {}
+    })();
+    """
+
+  /**
+   * Встроенная автономная DevTools-консоль в стиле Eruda (работает 100% без CDN и при жёстком CSP):
+   * вкладки Network (6-колоночная таблица + просмотр и копирование JSON), Console, Storage, Info.
+   */
+  val BUILTIN_DEVTOOLS_JS =
+    JS_NETWORK_BRIDGE_HOOK + "\n" +
     """
     (function(){
       try {
@@ -98,10 +203,39 @@ object InjectorScripts {
         }
         window.__nsPanelInit = true;
         var logs = [];
+        var activeTab = 'net';
+        var selectedNetIdx = -1;
+        function copyText(txt) {
+          try {
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+              navigator.clipboard.writeText(String(txt));
+              return;
+            }
+          } catch(_){}
+          try {
+            var ta = document.createElement('textarea');
+            ta.value = String(txt);
+            ta.style.position = 'fixed';
+            ta.style.opacity = '0';
+            document.body.appendChild(ta);
+            ta.select();
+            document.execCommand('copy');
+            document.body.removeChild(ta);
+          } catch(_){}
+        }
+        function shortCt(ct) {
+          var s = String(ct || '').toLowerCase();
+          if (s.indexOf('json') >= 0) return 'json';
+          if (s.indexOf('html') >= 0) return 'html';
+          if (s.indexOf('javascript') >= 0) return 'js';
+          if (s.indexOf('css') >= 0) return 'css';
+          if (s.indexOf('image') >= 0) return 'img';
+          return 'xhr';
+        }
         function addLog(kind, msg) {
           var t = new Date().toTimeString().slice(0,8);
           logs.unshift('[' + t + ' ' + kind + '] ' + String(msg));
-          if (logs.length > 80) logs.pop();
+          if (logs.length > 100) logs.pop();
           var out = document.getElementById('__ns_logs');
           if (out) out.textContent = logs.join('\n');
         }
@@ -117,47 +251,148 @@ object InjectorScripts {
             if (orig) return orig.apply(console, arguments);
           };
         });
-        if (window.fetch) {
-          var _f = window.fetch;
-          window.fetch = function(input, init){
-            var u = typeof input === 'string' ? input : (input && input.url) || '';
-            addLog('FETCH', ((init && init.method) || 'GET') + ' ' + u);
-            return _f.apply(this, arguments).then(function(r){
-              addLog('RESP', r.status + ' ' + u);
-              return r;
-            });
-          };
-        }
         var root = document.documentElement || document.body;
         var btn = document.createElement('div');
         btn.id = '__ns_fab';
-        btn.textContent = 'NS JS';
-        btn.style.cssText = 'position:fixed;right:12px;bottom:14px;z-index:2147483647;background:#0b1220;color:#00e5ff;border:2px solid #00e5ff;border-radius:999px;padding:8px 12px;font:bold 12px monospace;box-shadow:0 4px 16px rgba(0,0,0,.5);';
+        btn.textContent = '</>';
+        btn.style.cssText = 'position:fixed;right:12px;bottom:14px;z-index:2147483647;background:#181a1f;color:#00e5ff;border:2px solid #00e5ff;border-radius:999px;padding:8px 11px;font:bold 12px monospace;box-shadow:0 4px 16px rgba(0,0,0,.6);';
         var box = document.createElement('div');
         box.id = '__ns_box';
-        box.style.cssText = 'position:fixed;left:8px;right:8px;bottom:56px;height:46vh;z-index:2147483647;background:rgba(11,18,32,0.96);color:#e2e8f0;border:1px solid #00e5ff;border-radius:12px;display:flex;flex-direction:column;padding:8px;font:12px monospace;box-sizing:border-box;';
+        box.style.cssText = 'position:fixed;left:0;right:0;bottom:0;height:58vh;z-index:2147483647;background:#1e2022;color:#e2e8f0;border-top:1px solid #3a3d42;display:flex;flex-direction:column;font:11.5px monospace;box-sizing:border-box;';
         box.innerHTML =
-          '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">' +
-          '<b style="color:#00e5ff">NetScope DevTools (Офлайн)</b>' +
-          '<div><button id="__ns_info" style="margin-right:4px;background:#1e293b;color:#fff;border:0;border-radius:6px;padding:4px 8px">Storage</button>' +
-          '<button id="__ns_hide" style="background:#334155;color:#fff;border:0;border-radius:6px;padding:4px 8px">Свернуть</button></div></div>' +
+          '<div style="display:flex;background:#242629;border-bottom:1px solid #3a3d42;overflow-x:auto">' +
+          '<button data-t="net" class="__nst" style="flex:1;padding:8px 6px;background:#2c2f33;color:#fff;border:0;border-bottom:2px solid #5e97f6;font:bold 11.5px sans-serif">Network</button>' +
+          '<button data-t="con" class="__nst" style="flex:1;padding:8px 6px;background:transparent;color:#9aa0a6;border:0;font:11.5px sans-serif">Console</button>' +
+          '<button data-t="sto" class="__nst" style="flex:1;padding:8px 6px;background:transparent;color:#9aa0a6;border:0;font:11.5px sans-serif">Storage</button>' +
+          '<button data-t="inf" class="__nst" style="flex:1;padding:8px 6px;background:transparent;color:#9aa0a6;border:0;font:11.5px sans-serif">Info</button>' +
+          '<button id="__ns_hide" style="padding:8px 10px;background:transparent;color:#9aa0a6;border:0;font-weight:bold">▼</button>' +
+          '</div>' +
+          '<div id="__ns_p_net" style="flex:1;display:flex;flex-direction:column;overflow:hidden">' +
+          '<div style="display:flex;justify-content:space-between;align-items:center;padding:4px 8px;background:#202225;border-bottom:1px solid #34373c">' +
+          '<div><span style="color:#f87171">●</span> <button id="__ns_net_clr" style="background:transparent;color:#9aa0a6;border:0;font:12px sans-serif;margin-left:6px">⊘ Очистить</button></div>' +
+          '<div><button id="__ns_net_copyall" style="background:#2d323a;color:#e2e8f0;border:0;border-radius:4px;padding:3px 8px;font:11px sans-serif">❐ Копировать все</button></div></div>' +
+          '<div id="__ns_net_hdr" style="display:grid;grid-template-columns:2.2fr 0.8fr 0.8fr 0.7fr 0.9fr 0.9fr;background:#242629;color:#9aa0a6;border-bottom:1px solid #3a3d42;font-size:10.5px">' +
+          '<div style="padding:4px;border-right:1px solid #34373c">Name</div><div style="padding:4px;border-right:1px solid #34373c">Meth</div><div style="padding:4px;border-right:1px solid #34373c">Status</div><div style="padding:4px;border-right:1px solid #34373c">Type</div><div style="padding:4px;border-right:1px solid #34373c">Size</div><div style="padding:4px">Time</div></div>' +
+          '<div id="__ns_net_list" style="flex:1;overflow:auto"></div>' +
+          '<div id="__ns_net_det" style="display:none;flex:1;flex-direction:column;overflow:hidden;background:#181a1f">' +
+          '<div style="display:flex;gap:6px;padding:6px;background:#242629;border-bottom:1px solid #3a3d42">' +
+          '<button id="__ns_det_back" style="background:#334155;color:#fff;border:0;border-radius:4px;padding:4px 8px">← Назад</button>' +
+          '<button id="__ns_det_copy" style="background:#00e5ff;color:#060c16;border:0;border-radius:4px;padding:4px 8px;font-weight:bold">Копировать JSON</button>' +
+          '<button id="__ns_det_url" style="background:#2d323a;color:#fff;border:0;border-radius:4px;padding:4px 8px">URL</button></div>' +
+          '<pre id="__ns_det_txt" style="flex:1;overflow:auto;margin:0;padding:8px;white-space:pre-wrap;word-break:break-all;font:11px monospace;color:#cbd5e1"></pre></div></div>' +
+          '<div id="__ns_p_con" style="flex:1;display:none;flex-direction:column;padding:6px;overflow:hidden">' +
           '<div style="display:flex;gap:4px;margin-bottom:6px">' +
-          '<input id="__ns_in" placeholder="JS код (напр. document.title)" style="flex:1;background:#172134;color:#fff;border:1px solid #334155;border-radius:6px;padding:6px;font:12px monospace"/>' +
-          '<button id="__ns_run" style="background:#00e5ff;color:#060c16;border:0;border-radius:6px;padding:6px 10px;font-weight:bold">Run</button></div>' +
-          '<pre id="__ns_logs" style="flex:1;overflow:auto;margin:0;white-space:pre-wrap;word-break:break-all;font:11px monospace;color:#34d399"></pre>';
+          '<input id="__ns_in" placeholder="JS (напр. document.cookie)" style="flex:1;background:#171a1f;color:#fff;border:1px solid #3a3d42;border-radius:4px;padding:5px;font:11.5px monospace"/>' +
+          '<button id="__ns_run" style="background:#5e97f6;color:#fff;border:0;border-radius:4px;padding:5px 10px;font-weight:bold">Run</button></div>' +
+          '<pre id="__ns_logs" style="flex:1;overflow:auto;margin:0;white-space:pre-wrap;word-break:break-all;font:11px monospace;color:#34d399"></pre></div>' +
+          '<div id="__ns_p_sto" style="flex:1;display:none;flex-direction:column;padding:6px;overflow:auto"></div>' +
+          '<div id="__ns_p_inf" style="flex:1;display:none;flex-direction:column;padding:6px;overflow:auto"></div>';
         root.appendChild(box);
         root.appendChild(btn);
+
+        function renderNet() {
+          var list = document.getElementById('__ns_net_list');
+          var det = document.getElementById('__ns_net_det');
+          var hdr = document.getElementById('__ns_net_hdr');
+          if (!list || !det) return;
+          var recs = window.__nsNetRecords || [];
+          if (selectedNetIdx >= 0 && recs[selectedNetIdx]) {
+            var r = recs[selectedNetIdx];
+            list.style.display = 'none';
+            if (hdr) hdr.style.display = 'none';
+            det.style.display = 'flex';
+            var formatted = r.respBody || '';
+            try { formatted = JSON.stringify(JSON.parse(formatted), null, 2); } catch(_){}
+            document.getElementById('__ns_det_txt').textContent =
+              r.method + ' ' + r.url + '\nStatus: ' + r.status + ' • ' + r.time + 'ms\n\n--- Headers ---\n' +
+              JSON.stringify(r.reqHeaders || {}, null, 2) + '\n\n--- Body ---\n' + (r.reqBody || '(empty)') +
+              '\n\n--- Response ---\n' + (formatted || '(empty)');
+            return;
+          }
+          det.style.display = 'none';
+          if (hdr) hdr.style.display = 'grid';
+          list.style.display = 'block';
+          list.innerHTML = '';
+          recs.forEach(function(r, idx) {
+            var row = document.createElement('div');
+            var bg = (idx % 2 === 1) ? '#1b2333' : '#1e2022';
+            var stCol = (r.status >= 200 && r.status < 300) ? '#cbd5e1' : (r.status >= 400 ? '#f87171' : '#9aa0a6');
+            row.style.cssText = 'display:grid;grid-template-columns:2.2fr 0.8fr 0.8fr 0.7fr 0.9fr 0.9fr;background:' + bg + ';border-bottom:1px solid #2b2e33;font-size:11px;cursor:pointer';
+            row.innerHTML =
+              '<div style="padding:5px 4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;border-right:1px solid #2b2e33;color:#e2e8f0">' + r.name + '</div>' +
+              '<div style="padding:5px 4px;border-right:1px solid #2b2e33;color:#9aa0a6">' + r.method + '</div>' +
+              '<div style="padding:5px 4px;border-right:1px solid #2b2e33;color:' + stCol + '">' + (r.status || '---') + '</div>' +
+              '<div style="padding:5px 4px;border-right:1px solid #2b2e33;color:#9aa0a6">' + shortCt(r.ct) + '</div>' +
+              '<div style="padding:5px 4px;border-right:1px solid #2b2e33;color:#9aa0a6">' + r.size + '</div>' +
+              '<div style="padding:5px 4px;color:#9aa0a6">' + r.time + 'ms</div>';
+            row.onclick = function() { selectedNetIdx = idx; renderNet(); };
+            list.appendChild(row);
+          });
+        }
+        window.__nsUpdateNetUI = renderNet;
+
+        function renderStorage() {
+          var sto = document.getElementById('__ns_p_sto');
+          if (!sto) return;
+          var ls = {};
+          try { for (var i = 0; i < localStorage.length; i++) { var k = localStorage.key(i); ls[k] = localStorage.getItem(k); } } catch(_){}
+          sto.innerHTML = '<button id="__ns_copy_sto" style="align-self:flex-start;margin-bottom:6px;background:#00e5ff;color:#060c16;border:0;border-radius:4px;padding:4px 8px;font-weight:bold">Копировать Cookie + Storage</button>' +
+            '<pre style="margin:0;white-space:pre-wrap;word-break:break-all;color:#cbd5e1">' +
+            'Cookie:\n' + (document.cookie || '(пусто)') + '\n\nlocalStorage:\n' + JSON.stringify(ls, null, 2) + '</pre>';
+          document.getElementById('__ns_copy_sto').onclick = function() {
+            copyText(JSON.stringify({ url: location.href, cookie: document.cookie, localStorage: ls }, null, 2));
+          };
+        }
+
+        function renderInfo() {
+          var inf = document.getElementById('__ns_p_inf');
+          if (!inf) return;
+          var infoObj = { url: location.href, title: document.title, ua: navigator.userAgent, tg: window.Telegram && window.Telegram.WebApp ? window.Telegram.WebApp.initData : null };
+          inf.innerHTML = '<button id="__ns_copy_inf" style="align-self:flex-start;margin-bottom:6px;background:#00e5ff;color:#060c16;border:0;border-radius:4px;padding:4px 8px;font-weight:bold">Копировать Info</button>' +
+            '<pre style="margin:0;white-space:pre-wrap;word-break:break-all;color:#cbd5e1">' + JSON.stringify(infoObj, null, 2) + '</pre>';
+          document.getElementById('__ns_copy_inf').onclick = function() { copyText(JSON.stringify(infoObj, null, 2)); };
+        }
+
+        var tabBtns = box.querySelectorAll('.__nst');
+        tabBtns.forEach(function(tb) {
+          tb.onclick = function() {
+            activeTab = tb.getAttribute('data-t');
+            tabBtns.forEach(function(b) {
+              var on = b.getAttribute('data-t') === activeTab;
+              b.style.background = on ? '#2c2f33' : 'transparent';
+              b.style.color = on ? '#fff' : '#9aa0a6';
+              b.style.borderBottom = on ? '2px solid #5e97f6' : '0';
+              b.style.fontWeight = on ? 'bold' : 'normal';
+            });
+            document.getElementById('__ns_p_net').style.display = activeTab === 'net' ? 'flex' : 'none';
+            document.getElementById('__ns_p_con').style.display = activeTab === 'con' ? 'flex' : 'none';
+            document.getElementById('__ns_p_sto').style.display = activeTab === 'sto' ? 'flex' : 'none';
+            document.getElementById('__ns_p_inf').style.display = activeTab === 'inf' ? 'flex' : 'none';
+            if (activeTab === 'net') renderNet();
+            if (activeTab === 'sto') renderStorage();
+            if (activeTab === 'inf') renderInfo();
+          };
+        });
+
         btn.onclick = function(){ box.style.display = (box.style.display === 'none') ? 'flex' : 'none'; };
         document.getElementById('__ns_hide').onclick = function(){ box.style.display = 'none'; };
+        document.getElementById('__ns_net_clr').onclick = function(){ window.__nsNetRecords = []; selectedNetIdx = -1; renderNet(); };
+        document.getElementById('__ns_net_copyall').onclick = function(){ copyText(JSON.stringify(window.__nsNetRecords || [], null, 2)); };
+        document.getElementById('__ns_det_back').onclick = function(){ selectedNetIdx = -1; renderNet(); };
+        document.getElementById('__ns_det_copy').onclick = function(){
+          var r = (window.__nsNetRecords || [])[selectedNetIdx];
+          if (r) copyText(r.respBody || JSON.stringify(r, null, 2));
+        };
+        document.getElementById('__ns_det_url').onclick = function(){
+          var r = (window.__nsNetRecords || [])[selectedNetIdx];
+          if (r) copyText(r.url);
+        };
         document.getElementById('__ns_run').onclick = function(){
           var code = document.getElementById('__ns_in').value;
           try { addLog('EVAL', JSON.stringify(eval(code))); } catch(e) { addLog('ERR', e); }
         };
-        document.getElementById('__ns_info').onclick = function(){
-          addLog('COOKIE', document.cookie || '(пусто)');
-          try { addLog('LS_KEYS', Object.keys(localStorage).join(', ') || '(пусто)'); } catch(e){}
-        };
         addLog('READY', location.href);
+        renderNet();
       } catch(e) { console.error(e); }
     })();
     """

@@ -478,6 +478,10 @@ fun InjectorScreen(
                   displayZoomControls = false
                   mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
                 }
+                addJavascriptInterface(
+                  com.netscope.feature.injector.data.WebViewNetworkBridge(),
+                  "__nsNativeBridge",
+                )
                 webChromeClient =
                   object : WebChromeClient() {
                     override fun onProgressChanged(view: WebView?, newProgress: Int) {
@@ -491,7 +495,10 @@ fun InjectorScreen(
                       webErrorText = null
                       if (!url.isNullOrBlank()) urlInput = url
                       canGoBack = view?.canGoBack() == true
-                      if (view != null) probeAndInject(view)
+                      if (view != null) {
+                        view.evaluateJavascript(InjectorScripts.JS_NETWORK_BRIDGE_HOOK, null)
+                        probeAndInject(view)
+                      }
                     }
 
                     override fun onLoadResource(view: WebView?, url: String?) {
@@ -501,6 +508,7 @@ fun InjectorScreen(
                     override fun onPageFinished(view: WebView?, url: String?) {
                       canGoBack = view?.canGoBack() == true
                       if (view != null) {
+                        view.evaluateJavascript(InjectorScripts.JS_NETWORK_BRIDGE_HOOK, null)
                         probeAndInject(view)
                         if (store.config.value.logVisits && !url.isNullOrBlank()) {
                           store.logVisit(url, view.title.orEmpty())
